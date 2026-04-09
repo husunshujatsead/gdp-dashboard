@@ -277,11 +277,11 @@ st.caption("Platform-wise & Platform-Category sales pivots, replicated from the 
 # --- Sidebar: data source & filters --------------------------------------
 with st.sidebar:
     st.header("⚙︎ Data & Filters")
-    uploaded = st.file_uploader("Upload Online Shopping workbook (.xlsx)", type=["xlsx"])
-    default_path = Path("Online Shopping MTD (1).xlsx")
-    if uploaded is not None:
-         data_source = uploaded
-    elif default_path.exists():
+    #uploaded = st.file_uploader("Upload Online Shopping workbook (.xlsx)", type=["xlsx"])
+    default_path = Path("Online Shopping 24-26 (1).xlsx")
+    #if uploaded is not None:
+    #     data_source = uploaded
+    if default_path.exists():
         data_source = default_path
         st.info(f"Using default file: `{default_path.name}`")
     else:
