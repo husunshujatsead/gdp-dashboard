@@ -257,7 +257,7 @@ def load_historic(path_or_buffer) -> pd.DataFrame:
     })
     df["Platform"] = df["CustomerName"].apply(_infer_platform)
     df["Category"] = df["ItemCategory"].map(CATEGORY_MAP).fillna("Other")
-    df["Format"] = df["ItemGroupName"].astype(str)
+    df["Brand"] = df["ItemGroupName"].astype(str)
     df["SKU_label"] = df["ItemSubGroupDescription"].astype(str)
     # Month is int in this file
     df["MonthNum"] = df["Month"].astype(int)
@@ -272,7 +272,7 @@ def load_historic(path_or_buffer) -> pd.DataFrame:
     return df[["Year", "Month", "MonthNum", "Day", "Date",
                "DepotName", "CustomerName", "Platform",
                "ItemCategory", "ItemGroupName", "ItemSubGroupDescription",
-               "AlternateCode", "Category", "Format", "SKU_label",
+               "AlternateCode", "Category", "Brand", "SKU_label",
                "Sales Val", "Sales Qty"]]
 
 
@@ -283,7 +283,7 @@ def load_mtd(path_or_buffer) -> pd.DataFrame:
     df.columns = [c.strip() for c in df.columns]
     df["Platform"] = df["CustGroup"].map(PLATFORM_MAP).fillna("Other")
     df["Category"] = df["ItemCategory"].map(CATEGORY_MAP).fillna("Other")
-    df["Format"] = df["ItemGroupName"].astype(str)
+    df["Brand"] = df["ItemGroupName"].astype(str)
     df["SKU_label"] = df["ItemSubGroupDescription"].astype(str)
     month_to_num = {m: i + 1 for i, m in enumerate(MONTH_ORDER)}
     df["MonthNum"] = df["Month"].map(month_to_num)
@@ -296,7 +296,7 @@ def load_mtd(path_or_buffer) -> pd.DataFrame:
     return df[["Year", "Month", "MonthNum", "Day", "Date",
                "DepotName", "CustomerName", "Platform",
                "ItemCategory", "ItemGroupName", "ItemSubGroupDescription",
-               "AlternateCode", "Category", "Format", "SKU_label",
+               "AlternateCode", "Category", "Brand", "SKU_label",
                "Sales Val", "Sales Qty"]]
 
 
@@ -322,7 +322,8 @@ st.markdown(
     f"""
     <div class="saudia-hero">
       <div style="text-align:center; width:100%;">
-        <div class="saudia-title">Sadafco Sales Tracker</div>
+        <div class="saudia-title">Online Shopping — Sales Dashboard</div>
+        <div class="saudia-sub">Platform-wise & Platform-Category sales pivots, replicated from the SADAFCO tracker.</div>
       </div>
     </div>
     """,
@@ -384,7 +385,7 @@ min_date = df["Date"].min().date() if df["Date"].notna().any() else max_date - t
 
 # default date range — full span of the data
 if "df_from" not in st.session_state:
-    st.session_state.df_from = min_date
+    st.session_state.df_from = max_date.replace(day=1)
     st.session_state.df_to   = max_date
 
 # Row 1 — dropdowns + date pickers
@@ -394,15 +395,15 @@ with c1:
     f_platform = st.selectbox("Platform", platforms, index=0)
 with c2:
     brand_pool = df if f_platform == "All" else df[df["Platform"] == f_platform]
-    brands = ["All"] + sorted(brand_pool["Format"].dropna().unique().tolist())
-    f_brand = st.selectbox("Format", brands, index=0)
+    brands = ["All"] + sorted(brand_pool["Brand"].dropna().unique().tolist())
+    f_brand = st.selectbox("Brand", brands, index=0)
 with c3:
     categories = ["All"] + sorted(df["Category"].unique().tolist())
     f_category = st.selectbox("Category", categories, index=0)
 with c4:
     sku_pool = df.copy()
     if f_platform != "All": sku_pool = sku_pool[sku_pool["Platform"] == f_platform]
-    if f_brand != "All":    sku_pool = sku_pool[sku_pool["Format"] == f_brand]
+    if f_brand != "All":    sku_pool = sku_pool[sku_pool["Brand"] == f_brand]
     if f_category != "All": sku_pool = sku_pool[sku_pool["Category"] == f_category]
     skus = ["All"] + sorted(sku_pool["SKU"].dropna().unique().tolist())
     f_sku = st.selectbox("SKU", skus, index=0)
@@ -422,7 +423,7 @@ st.markdown("</div>", unsafe_allow_html=True)  # /filter-bar
 # ---------------------------------------------------------------------------
 mask = (df["Date"].dt.date >= f_date_from) & (df["Date"].dt.date <= f_date_to)
 if f_platform != "All": mask &= df["Platform"] == f_platform
-if f_brand    != "All": mask &= df["Format"] == f_brand
+if f_brand    != "All": mask &= df["Brand"] == f_brand
 if f_category != "All": mask &= df["Category"] == f_category
 if f_sku      != "All": mask &= df["SKU"] == f_sku
 fdf = df[mask].copy()
@@ -563,7 +564,7 @@ else:
 # Base data — respects Platform/Brand/Category/SKU filters but NOT date range
 yoy_base = df.copy()
 if f_platform != "All": yoy_base = yoy_base[yoy_base["Platform"] == f_platform]
-if f_brand    != "All": yoy_base = yoy_base[yoy_base["Format"] == f_brand]
+if f_brand    != "All": yoy_base = yoy_base[yoy_base["Brand"] == f_brand]
 if f_category != "All": yoy_base = yoy_base[yoy_base["Category"] == f_category]
 if f_sku      != "All": yoy_base = yoy_base[yoy_base["SKU"] == f_sku]
 
@@ -759,7 +760,7 @@ st.markdown("<div class='sec-sub'>Sum of Sales Val by Platform × Month</div>", 
 # Build a base that respects dropdown filters but NOT the date range
 pivot_base = df.copy()
 if f_platform != "All": pivot_base = pivot_base[pivot_base["Platform"] == f_platform]
-if f_brand    != "All": pivot_base = pivot_base[pivot_base["Format"] == f_brand]
+if f_brand    != "All": pivot_base = pivot_base[pivot_base["Brand"] == f_brand]
 if f_category != "All": pivot_base = pivot_base[pivot_base["Category"] == f_category]
 if f_sku      != "All": pivot_base = pivot_base[pivot_base["SKU"] == f_sku]
 
@@ -925,6 +926,471 @@ else:
             f"<div class='pivot-wrap'><table>{phead}<tbody>{''.join(pbody)}</tbody></table></div>",
             unsafe_allow_html=True,
         )
+
+    st.caption("Note: Flavoured Milk 250ml is not a current SADAFCO online-range SKU; Flavoured Milk 200ml shown as the closest match.")
+
+# ===========================================================================
+# PRICING DASHBOARD
+# ===========================================================================
+import datetime as _dt
+
+DEFAULT_DATA_DASH = "Sadafco Data Dashboard (1).xlsx"
+
+def _parse_date_raw(v):
+    """Parse a single date value without swapping."""
+    if pd.isna(v):
+        return pd.NaT
+    if isinstance(v, str):
+        return pd.to_datetime(v, dayfirst=True, errors="coerce")
+    if isinstance(v, (_dt.datetime, pd.Timestamp)):
+        return pd.Timestamp(v)
+    return pd.NaT
+
+
+def _fix_dates_column(series: pd.Series) -> pd.Series:
+    """Two-pass fix for mixed Excel date formats.
+    String dates (dd/mm/yyyy) are reliable. Datetime objects from Excel may have
+    month/day swapped when day<=12. We detect swapped dates by comparing against
+    the months found in string-sourced dates.
+    """
+    is_str = series.apply(lambda v: isinstance(v, str))
+    parsed = series.apply(_parse_date_raw)
+
+    str_months = set(parsed[is_str].dropna().dt.month.unique())
+    if not str_months:
+        return parsed
+
+    dt_mask = ~is_str & parsed.notna()
+    result = parsed.copy()
+    for idx in result[dt_mask].index:
+        ts = result.at[idx]
+        if ts.month not in str_months and ts.day <= 12 and ts.day in str_months:
+            try:
+                result.at[idx] = pd.Timestamp(year=ts.year, month=ts.day, day=ts.month)
+            except Exception:
+                pass
+    return result
+
+
+@st.cache_data(show_spinner=False)
+def load_pricing(path_or_buffer) -> pd.DataFrame:
+    df = pd.read_excel(path_or_buffer, sheet_name="Price")
+    df.columns = [c.strip() for c in df.columns]
+    df["Date"] = _fix_dates_column(df["Date"])
+    df["Price"] = pd.to_numeric(df["Price"], errors="coerce")
+    return df
+
+
+@st.cache_data(show_spinner=False)
+def load_availability(path_or_buffer) -> pd.DataFrame:
+    df = pd.read_excel(path_or_buffer, sheet_name="Availability")
+    df.columns = [c.strip() for c in df.columns]
+    df["Date"] = _fix_dates_column(df["Date"])
+    df["Availability"] = pd.to_numeric(df["Availability"], errors="coerce")
+    return df
+
+
+# --- Load data dashboard file ---
+with st.sidebar:
+    st.markdown("---")
+    st.markdown(f"<h3 style='color:{NAVY_DARK};margin-top:0;'>Pricing & Availability</h3>", unsafe_allow_html=True)
+    data_dash_upload = st.file_uploader("Data Dashboard file (.xlsx)", type=["xlsx"],
+                                        key="data_dash_upload")
+
+dd_src = data_dash_upload if data_dash_upload is not None else DEFAULT_DATA_DASH
+price_df = None
+avail_df = None
+try:
+    price_df = load_pricing(dd_src)
+    avail_df = load_availability(dd_src)
+except Exception:
+    pass
+
+# ---- PRICING SECTION ----
+if price_df is not None and not price_df.empty:
+    st.markdown("<hr style='margin:40px 0 20px 0;border-color:#e5e7eb;'>", unsafe_allow_html=True)
+    st.markdown(
+        f"<div class='saudia-title' style='text-align:center;'>Pricing</div>"
+        f"<div class='sec-sub' style='text-align:center;'>Average prices (SAR) by Brand × Platform, with daily change.</div>",
+        unsafe_allow_html=True,
+    )
+
+    # Filters
+    pr_c1, pr_c2, pr_c3, pr_c4, pr_c5, pr_c6 = st.columns([1, 1, 1, 1, 1.2, 1.2])
+    with pr_c1:
+        pr_platforms = ["All"] + sorted(price_df["Platform"].dropna().unique().tolist())
+        pr_f_plat = st.selectbox("Platform", pr_platforms, index=0, key="pr_plat")
+    with pr_c2:
+        pr_brands = ["All"] + sorted(price_df["Brand"].dropna().unique().tolist())
+        pr_f_brand = st.selectbox("Brand", pr_brands, index=0, key="pr_brand")
+    with pr_c3:
+        pr_cats = ["All"] + sorted(price_df["Category"].dropna().unique().tolist())
+        pr_f_cat = st.selectbox("Category", pr_cats, index=0, key="pr_cat")
+    with pr_c4:
+        pr_types = ["All", "Brand", "Competitor"]
+        pr_f_type = st.selectbox("Type", pr_types, index=0, key="pr_type")
+    with pr_c5:
+        pr_min_date = price_df["Date"].min().date() if price_df["Date"].notna().any() else date.today()
+        pr_max_date = price_df["Date"].max().date() if price_df["Date"].notna().any() else date.today()
+        pr_date_from = st.date_input("Date from", value=pr_min_date,
+                                     min_value=pr_min_date, max_value=pr_max_date, key="pr_dfrom")
+    with pr_c6:
+        pr_date_to = st.date_input("Date to", value=pr_max_date,
+                                   min_value=pr_min_date, max_value=pr_max_date, key="pr_dto")
+
+    # Apply filters
+    pf = price_df.copy()
+    if pr_f_type != "All":
+        pf = pf[pf["Type"] == pr_f_type]
+    if pr_f_plat != "All":  pf = pf[pf["Platform"] == pr_f_plat]
+    if pr_f_brand != "All": pf = pf[pf["Brand"] == pr_f_brand]
+    if pr_f_cat != "All":   pf = pf[pf["Category"] == pr_f_cat]
+    pf = pf[(pf["Date"].dt.date >= pr_date_from) & (pf["Date"].dt.date <= pr_date_to)]
+
+    if pf.empty:
+        st.info("No pricing data for the selected filters.")
+    else:
+        # Compute avg price per Brand × Platform for the date range
+        # Change = avg price on latest date minus avg price on previous date
+        all_dates = sorted(pf["Date"].dropna().unique())
+
+        # Avg price over the full selected range
+        avg_prices = pf.pivot_table(index="Brand", columns="Platform",
+                                    values="Price", aggfunc="mean")
+
+        # Change: latest date vs second-latest date
+        change_df = pd.DataFrame(index=avg_prices.index, columns=avg_prices.columns, dtype=float)
+        if len(all_dates) >= 2:
+            latest = all_dates[-1]
+            prev = all_dates[-2]
+            for plat in avg_prices.columns:
+                for brand in avg_prices.index:
+                    lat_val = pf[(pf["Date"] == latest) & (pf["Platform"] == plat) &
+                                (pf["Brand"] == brand)]["Price"].mean()
+                    prev_val = pf[(pf["Date"] == prev) & (pf["Platform"] == plat) &
+                                 (pf["Brand"] == brand)]["Price"].mean()
+                    if pd.notna(lat_val) and pd.notna(prev_val):
+                        change_df.loc[brand, plat] = lat_val - prev_val
+                    else:
+                        change_df.loc[brand, plat] = 0.0
+
+        # Also compute Total (average across platforms)
+        avg_prices["Total"] = avg_prices.mean(axis=1)
+        if not change_df.empty:
+            change_df["Total"] = change_df.mean(axis=1)
+
+            # Render pricing table — unified, Brand (always shown) + optional Category expansion
+            plats = [c for c in avg_prices.columns if c != "Total"]
+
+            # Build Brand × Category level data
+            brand_cat_avg = pf.pivot_table(
+                index=["Brand", "Category"], columns="Platform",
+                values="Price", aggfunc="mean"
+            )
+            brand_cat_avg["Total"] = brand_cat_avg.mean(axis=1)
+
+            # Change at Brand × Category level
+            brand_cat_chg = pd.DataFrame(
+                index=brand_cat_avg.index, columns=brand_cat_avg.columns, dtype=float
+            ).fillna(0.0)
+            if len(all_dates) >= 2:
+                latest = all_dates[-1]
+                prev = all_dates[-2]
+                for (brand, cat) in brand_cat_avg.index:
+                    for plat in list(plats) + ["Total"]:
+                        if plat == "Total":
+                            lat_v = pf[(pf["Date"] == latest) & (pf["Brand"] == brand) & (pf["Category"] == cat)][
+                                "Price"].mean()
+                            prev_v = pf[(pf["Date"] == prev) & (pf["Brand"] == brand) & (pf["Category"] == cat)][
+                                "Price"].mean()
+                        else:
+                            lat_v = pf[(pf["Date"] == latest) & (pf["Platform"] == plat) & (pf["Brand"] == brand) & (
+                                        pf["Category"] == cat)]["Price"].mean()
+                            prev_v = pf[(pf["Date"] == prev) & (pf["Platform"] == plat) & (pf["Brand"] == brand) & (
+                                        pf["Category"] == cat)]["Price"].mean()
+                        if pd.notna(lat_v) and pd.notna(prev_v):
+                            brand_cat_chg.loc[(brand, cat), plat] = lat_v - prev_v
+
+
+            def fmt_change(v):
+                if pd.isna(v) or v == 0:
+                    return "<span style='color:#6B7280;font-weight:500'>—</span>"
+                color = "#E00034" if v < 0 else "#00A651"
+                return f"<span style='color:{color};font-weight:600'>SAR {v:+.2f}</span>"
+
+
+            def fmt_price(v):
+                return f"{v:.2f}" if pd.notna(v) else "—"
+
+
+            brands_in_order = avg_prices.index.tolist()
+
+            # Compact multiselect to choose which brands show category breakdown
+            expanded_brands = st.multiselect(
+                "Expand category breakdown for:",
+                options=brands_in_order,
+                default=[],
+                key="pr_expand_brands_ms",
+                placeholder="Select brands to see category detail…",
+            )
+            expanded_set = set(expanded_brands)
+
+            # Single unified table
+            pr_head = (
+                f"<thead>"
+                f"<tr>"
+                f"<th rowspan='2' style='text-align:left;min-width:200px;'>Brand / Category</th>"
+            )
+            for p in plats:
+                pr_head += f"<th colspan='2' style='text-align:center;'>{p}</th>"
+            pr_head += "<th colspan='2' style='text-align:center;'>Total</th></tr><tr>"
+            for _ in plats + ["Total"]:
+                pr_head += "<th>Price</th><th>Change</th>"
+            pr_head += "</tr></thead>"
+
+            pr_body = []
+            for brand in brands_in_order:
+                is_expanded = brand in expanded_set
+
+                # Brand row
+                brand_cells = ""
+                for p in plats + ["Total"]:
+                    pv = avg_prices.loc[brand, p] if p in avg_prices.columns else float("nan")
+                    cv = change_df.loc[brand, p] if (not change_df.empty and p in change_df.columns) else 0.0
+                    brand_cells += f"<td class='num'>{fmt_price(pv)}</td>"
+                    brand_cells += f"<td class='num'>{fmt_change(cv)}</td>"
+
+                indicator = "▾" if is_expanded else "▸"
+                pr_body.append(
+                    f"<tr style='background:#e8eef7;border-top:2px solid #c5d0e6;'>"
+                    f"<td style='font-weight:700;color:{NAVY_DARK};padding:10px 12px;font-size:13.5px;'>"
+                    f"{indicator} {brand}</td>"
+                    f"{brand_cells}</tr>"
+                )
+
+                # Category child rows
+                if is_expanded and brand in brand_cat_avg.index.get_level_values(0):
+                    cats_for_brand = brand_cat_avg.loc[brand].index.tolist()
+                    for i, cat in enumerate(cats_for_brand):
+                        cat_cells = ""
+                        for p in plats + ["Total"]:
+                            try:
+                                pv = brand_cat_avg.loc[(brand, cat), p]
+                            except KeyError:
+                                pv = float("nan")
+                            try:
+                                cv = brand_cat_chg.loc[(brand, cat), p]
+                            except KeyError:
+                                cv = 0.0
+                            cat_cells += f"<td class='num'>{fmt_price(pv)}</td>"
+                            cat_cells += f"<td class='num'>{fmt_change(cv)}</td>"
+                        row_bg = "#fafbfd" if i % 2 == 0 else "#f3f6fb"
+                        pr_body.append(
+                            f"<tr style='background:{row_bg};'>"
+                            f"<td style='padding:7px 12px 7px 32px;color:#374151;font-size:12.5px;border-left:3px solid {SAUDIA_BLUE};'>"
+                            f"<span style='color:{SAUDIA_BLUE};margin-right:6px;'>▸</span>{cat}</td>"
+                            f"{cat_cells}</tr>"
+                        )
+
+            # Total row
+            total_cells = ""
+            for p in plats + ["Total"]:
+                pv = avg_prices[p].mean() if p in avg_prices.columns else 0
+                cv = change_df[p].mean() if (not change_df.empty and p in change_df.columns) else 0
+                total_cells += f"<td class='num' style='font-weight:700'>{pv:.2f}</td>"
+                total_cells += f"<td class='num'>{fmt_change(cv)}</td>"
+            pr_body.append(
+                f"<tr style='border-top:3px solid {NAVY};background:#f0f4fa;'>"
+                f"<td style='font-weight:700;color:{NAVY_DARK};padding:10px 12px;'>Total</td>"
+                f"{total_cells}</tr>"
+            )
+
+            st.markdown(
+                f"<div class='pivot-wrap'><table>{pr_head}<tbody>{''.join(pr_body)}</tbody></table></div>",
+                unsafe_allow_html=True,
+            )
+
+# ---- AVAILABILITY SECTION ----
+if avail_df is not None and not avail_df.empty:
+    st.markdown("<hr style='margin:40px 0 20px 0;border-color:#e5e7eb;'>", unsafe_allow_html=True)
+    st.markdown(
+        f"<div class='saudia-title' style='text-align:center;'>Availability</div>"
+        f"<div class='sec-sub' style='text-align:center;'>SKU availability % by Brand × Platform, with period comparison.</div>",
+        unsafe_allow_html=True,
+    )
+
+    # Filters
+    av_c1, av_c2, av_c3, av_c4, av_c5, av_c6 = st.columns([1, 1, 1, 1, 1.2, 1.2])
+    with av_c1:
+        av_platforms = ["All"] + sorted(avail_df["Platform"].dropna().unique().tolist())
+        av_f_plat = st.selectbox("Platform", av_platforms, index=0, key="av_plat")
+    with av_c2:
+        av_stores = ["All"] + sorted(avail_df["Store"].dropna().unique().tolist())
+        av_f_store = st.selectbox("Store", av_stores, index=0, key="av_store")
+    with av_c3:
+        av_cats = ["All"] + sorted(avail_df["Category"].dropna().unique().tolist())
+        av_f_cat = st.selectbox("Category", av_cats, index=0, key="av_cat")
+    with av_c4:
+        av_brands = ["All"] + sorted(avail_df["Brand"].dropna().unique().tolist())
+        av_f_brand = st.selectbox("Brand", av_brands, index=0, key="av_brand")
+    # with av_c5:
+    #     av_min_date = avail_df["Date"].min().date() if avail_df["Date"].notna().any() else date.today()
+    #     av_max_date = avail_df["Date"].max().date() if avail_df["Date"].notna().any() else date.today()
+    #     av_date_from = st.date_input("Date from", value=av_min_date,
+    #                                  min_value=av_min_date, max_value=av_max_date, key="av_dfrom")
+    # with av_c6:
+    #     av_date_to = st.date_input("Date to", value=av_max_date,
+    #                                min_value=av_min_date, max_value=av_max_date, key="av_dto")
+
+    with av_c5:
+        av_min_date = avail_df["Date"].min().date() if avail_df["Date"].notna().any() else date.today()
+        av_max_date = avail_df["Date"].max().date() if avail_df["Date"].notna().any() else date.today()
+        av_date_from = st.date_input("Date from", value=av_min_date,
+                                     min_value=av_min_date, max_value=av_max_date, key="av_dfrom")
+    with av_c6:
+        av_date_to = st.date_input("Date to", value=av_max_date,
+                                   min_value=av_min_date, max_value=av_max_date, key="av_dto")
+
+    # Compare To date range — explicit, separate from the auto prior-period logic
+    av_cmp_c1, av_cmp_c2, av_cmp_c3 = st.columns([2, 1, 1])
+    with av_cmp_c1:
+        st.markdown(
+            f"<div style='padding-top:28px;font-size:13px;font-weight:600;color:{NAVY_DARK};'>"
+            f"Compare to period:</div>",
+            unsafe_allow_html=True,
+        )
+    with av_cmp_c2:
+        range_days = (av_date_to - av_date_from).days
+        default_comp_from = max(av_date_from - timedelta(days=range_days + 1), av_min_date)
+        default_comp_to = max(av_date_from - timedelta(days=1), av_min_date)
+        av_comp_from = st.date_input("Compare from", value=default_comp_from,
+                                     min_value=av_min_date, max_value=av_max_date, key="av_cmp_from")
+    with av_cmp_c3:
+        av_comp_to = st.date_input("Compare to", value=default_comp_to,
+                                   min_value=av_min_date, max_value=av_max_date, key="av_cmp_to")
+    # Apply filters
+    af = avail_df.copy()
+    if av_f_plat != "All":  af = af[af["Platform"] == av_f_plat]
+    if av_f_store != "All": af = af[af["Store"] == av_f_store]
+    if av_f_cat != "All":   af = af[af["Category"] == av_f_cat]
+    if av_f_brand != "All": af = af[af["Brand"] == av_f_brand]
+    af = af[(af["Date"].dt.date >= av_date_from) & (af["Date"].dt.date <= av_date_to)]
+
+    if af.empty:
+        st.info("No availability data for the selected filters.")
+    else:
+        overall_avail = af["Availability"].mean() * 100
+
+        # KPI
+        st.markdown(
+            f"<div style='text-align:center;margin:16px 0;'>"
+            f"<span style='font-size:48px;font-weight:700;color:{NAVY_DARK}'>{overall_avail:.0f}%</span>"
+            f"<br><span style='color:{MUTED};font-size:14px;'>Availability</span></div>",
+            unsafe_allow_html=True,
+        )
+
+        # Availability by Brand
+        brand_avail = (af.groupby("Brand")["Availability"].mean() * 100).round(1)
+
+        # Compute vs comparison period (same length window before the selected range)
+        # Use the explicitly chosen comparison period
+        comp_from = av_comp_from
+        comp_to = av_comp_to
+        af_comp = avail_df.copy()
+
+        if av_f_plat != "All":  af_comp = af_comp[af_comp["Platform"] == av_f_plat]
+        if av_f_store != "All": af_comp = af_comp[af_comp["Store"] == av_f_store]
+        if av_f_cat != "All":   af_comp = af_comp[af_comp["Category"] == av_f_cat]
+        if av_f_brand != "All": af_comp = af_comp[af_comp["Brand"] == av_f_brand]
+        af_comp = af_comp[(af_comp["Date"].dt.date >= comp_from) & (af_comp["Date"].dt.date <= comp_to)]
+        comp_brand = (af_comp.groupby("Brand")["Availability"].mean() * 100).round(1) if not af_comp.empty else pd.Series(dtype=float)
+
+        # MTD & YTD
+        today = av_date_to
+        mtd_start = today.replace(day=1)
+        ytd_start = today.replace(month=1, day=1)
+        af_full = avail_df.copy()
+        if av_f_plat != "All":  af_full = af_full[af_full["Platform"] == av_f_plat]
+        if av_f_store != "All": af_full = af_full[af_full["Store"] == av_f_store]
+        if av_f_cat != "All":   af_full = af_full[af_full["Category"] == av_f_cat]
+        if av_f_brand != "All": af_full = af_full[af_full["Brand"] == av_f_brand]
+
+        af_mtd = af_full[(af_full["Date"].dt.date >= mtd_start) & (af_full["Date"].dt.date <= today)]
+        af_ytd = af_full[(af_full["Date"].dt.date >= ytd_start) & (af_full["Date"].dt.date <= today)]
+        mtd_brand = (af_mtd.groupby("Brand")["Availability"].mean() * 100).round(1) if not af_mtd.empty else pd.Series(dtype=float)
+        ytd_brand = (af_ytd.groupby("Brand")["Availability"].mean() * 100).round(1) if not af_ytd.empty else pd.Series(dtype=float)
+
+        # Build table
+        av_head = ("<thead><tr><th>Brand</th><th>Availability</th>"
+                   "<th>vs Chosen Period</th><th>MTD</th><th>YTD</th></tr></thead>")
+
+        def fmt_avail_pct(v):
+            if pd.isna(v):
+                return "<span style='color:#9ca3af'>—</span>"
+            color = "#E00034" if v < 60 else ("#FF9800" if v < 80 else "#00A651")
+            return f"<span style='color:{color};font-weight:600'>{v:.0f}%</span>"
+
+        def fmt_vs_period(curr, prev):
+            if pd.isna(curr) or pd.isna(prev):
+                return "<span style='color:#9ca3af'>—</span>"
+            diff = curr - prev
+            if diff > 0:
+                return f"<span style='color:#00A651;font-weight:600'>▲ {diff:+.0f}%</span>"
+            elif diff < 0:
+                return f"<span style='color:#E00034;font-weight:600'>▼ {diff:+.0f}%</span>"
+            return f"<span style='color:{MUTED}'>0%</span>"
+
+        av_body = []
+        for brand in brand_avail.index:
+            avail_val = brand_avail.get(brand, float("nan"))
+            comp_val = comp_brand.get(brand, float("nan"))
+            mtd_val = mtd_brand.get(brand, float("nan"))
+            ytd_val = ytd_brand.get(brand, float("nan"))
+            av_body.append(
+                f"<tr><td class='row-label'>{brand}</td>"
+                f"<td class='num'>{fmt_avail_pct(avail_val)}</td>"
+                f"<td class='num'>{fmt_vs_period(avail_val, comp_val)}</td>"
+                f"<td class='num'>{fmt_avail_pct(mtd_val)}</td>"
+                f"<td class='num'>{fmt_avail_pct(ytd_val)}</td></tr>"
+            )
+
+        # Total row
+        total_avail = brand_avail.mean()
+        total_comp = comp_brand.mean() if not comp_brand.empty else float("nan")
+        total_mtd = mtd_brand.mean() if not mtd_brand.empty else float("nan")
+        total_ytd = ytd_brand.mean() if not ytd_brand.empty else float("nan")
+        av_body.append(
+            f"<tr style='border-top:2px solid {NAVY}'>"
+            f"<td class='row-label' style='font-weight:700'>Total</td>"
+            f"<td class='num'>{fmt_avail_pct(total_avail)}</td>"
+            f"<td class='num'>{fmt_vs_period(total_avail, total_comp)}</td>"
+            f"<td class='num'>{fmt_avail_pct(total_mtd)}</td>"
+            f"<td class='num'>{fmt_avail_pct(total_ytd)}</td></tr>"
+        )
+
+        st.markdown(
+            f"<div class='pivot-wrap'><table>{av_head}<tbody>{''.join(av_body)}</tbody></table></div>",
+            unsafe_allow_html=True,
+        )
+
+        # Availability by Platform
+        st.markdown("<div class='sec-title' style='margin-top:18px;'>Availability by Platform</div>", unsafe_allow_html=True)
+        plat_avail = (af.groupby("Platform")["Availability"].mean() * 100).round(1)
+        if not plat_avail.empty:
+            fig = go.Figure(go.Bar(
+                x=plat_avail.index, y=plat_avail.values,
+                marker_color=[PLATFORM_COLORS.get(p, "#9CA3AF") for p in plat_avail.index],
+                text=[f"{v:.0f}%" for v in plat_avail.values],
+                textposition="outside",
+            ))
+            fig.update_layout(
+                height=340, margin=dict(l=10, r=10, t=10, b=10),
+                plot_bgcolor="white",
+                yaxis=dict(gridcolor="#e5e7eb", title="Availability %", range=[0, 105]),
+                xaxis=dict(title=""),
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
 # ---------------------------------------------------------------------------
 # Download
 # ---------------------------------------------------------------------------
@@ -938,20 +1404,20 @@ def build_excel() -> bytes:
         if vol_rows:
             pd.DataFrame(vol_rows).set_index("SKU").to_excel(
                 xl, sheet_name="Focus SKU Volumes")
-        fdf[["Date", "Platform", "Category", "Format", "SKU",
+        fdf[["Date", "Platform", "Category", "Brand", "SKU",
              "Sales Val", "Sales Qty"]].to_excel(xl, sheet_name="Filtered Data", index=False)
     return out.getvalue()
 
-#
-# st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
-# st.download_button(
-#     "⬇  Download pivots as Excel",
-#     data=build_excel(),
-#     file_name="sadafco_online_shopping_pivots.xlsx",
-#     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-# )
-#
-# st.caption(
-#     "Platforms are mapped from `CustGroup`; minor / one-off customer groups are bucketed as **Other**. "
-#     "Categories are normalised from `ItemCategory` (ICE CREAM & FROZEN FOOD → Frozen, NON-DAIRY DRINKS → Drinks, etc.)."
-# )
+
+st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
+st.download_button(
+    "⬇  Download pivots as Excel",
+    data=build_excel(),
+    file_name="sadafco_online_shopping_pivots.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+)
+
+st.caption(
+    "Platforms are mapped from `CustGroup`; minor / one-off customer groups are bucketed as **Other**. "
+    "Categories are normalised from `ItemCategory` (ICE CREAM & FROZEN FOOD → Frozen, NON-DAIRY DRINKS → Drinks, etc.)."
+)
