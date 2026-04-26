@@ -165,6 +165,8 @@ st.markdown(
       .drill-tree .level-2 {{ padding-left: 60px; background: #f5f7fb; }}
       .drill-tree .level-3 {{ padding-left: 84px; background: #f0f3fa; font-size: 12px; color: {MUTED}; }}
       .drill-tree .level-3 .name {{ font-weight: 500; color: {MUTED}; }}
+      .drill-tree .level-4 {{ padding-left: 108px; background: #e8edf6; font-size: 12px; color: {MUTED}; }}
+      .drill-tree .level-4 .name {{ font-weight: 500; color: {MUTED}; }}
 
       .drill-tree .total {{
           background: #fff !important; border-top: 2px solid {NAVY};
@@ -1473,7 +1475,11 @@ with tab_availability:
 
             has_store = "Store" in af_main.columns and af_main["Store"].notna().any()
             has_sku = "SKU" in af_main.columns and af_main["SKU"].notna().any()
-            hierarchy = ["Platform", "Category"] + (["SKU"] if has_sku else []) + (["Store"] if has_store else [])
+            has_brand = "Brand" in af_main.columns and af_main["Brand"].notna().any()
+            hierarchy = (["Platform", "Category"]
+                         + (["Brand"] if has_brand else [])
+                         + (["SKU"] if has_sku else [])
+                         + (["Store"] if has_store else []))
 
             # ----- single-pass aggregates per period, per level -----
             main_lv = _hier_means(af_main, hierarchy, "Availability", multiplier=100.0)
@@ -1528,6 +1534,8 @@ with tab_availability:
             plat_series = main_lv[1].sort_values(ascending=False) if not main_lv[1].empty else pd.Series(dtype=float)
 
             n_levels = len(hierarchy)
+            # Hierarchy when fully populated:
+            #   1=Platform, 2=Category, 3=Brand, 4=SKU, 5=Store
             for plat in plat_series.index:
                 plat_label = _esc(plat)
                 # Categories under platform
@@ -1558,16 +1566,17 @@ with tab_availability:
 
                 for cat in cat_series.sort_values(ascending=False).index:
                     cat_label = _esc(cat)
-                    sku_series = pd.Series(dtype=float)
-                    if has_sku and n_levels >= 3 and not main_lv[3].empty:
+                    # Brands under this category
+                    brand_series = pd.Series(dtype=float)
+                    if has_brand and n_levels >= 3 and not main_lv[3].empty:
                         try:
-                            sku_series = main_lv[3].loc[(plat, cat)]
-                            if isinstance(sku_series, float):
-                                sku_series = pd.Series(dtype=float)
+                            brand_series = main_lv[3].loc[(plat, cat)]
+                            if isinstance(brand_series, float):
+                                brand_series = pd.Series(dtype=float)
                         except KeyError:
                             pass
 
-                    if sku_series.empty:
+                    if brand_series.empty:
                         parts.append(
                             f"<div class='row level-1'>"
                             f"<span><span class='caret-empty'></span> "
@@ -1583,40 +1592,70 @@ with tab_availability:
                         f"{cells4(2, (plat, cat))}</div></summary>"
                     )
 
-                    for sku in sku_series.sort_values(ascending=False).index:
-                        sku_label = _strip_pcz(sku)
-                        store_series = pd.Series(dtype=float)
-                        if has_store and n_levels >= 4 and not main_lv[4].empty:
+                    for brand in brand_series.sort_values(ascending=False).index:
+                        brand_label = _esc(brand)
+                        # SKUs under this brand
+                        sku_series = pd.Series(dtype=float)
+                        if has_sku and n_levels >= 4 and not main_lv[4].empty:
                             try:
-                                store_series = main_lv[4].loc[(plat, cat, sku)]
-                                if isinstance(store_series, float):
-                                    store_series = pd.Series(dtype=float)
+                                sku_series = main_lv[4].loc[(plat, cat, brand)]
+                                if isinstance(sku_series, float):
+                                    sku_series = pd.Series(dtype=float)
                             except KeyError:
                                 pass
 
-                        if store_series.empty:
+                        if sku_series.empty:
                             parts.append(
                                 f"<div class='row level-2'>"
                                 f"<span><span class='caret-empty'></span> "
-                                f"<span class='name'>{sku_label}</span></span>"
-                                f"{cells4(3, (plat, cat, sku))}</div>"
+                                f"<span class='name'>{brand_label}</span></span>"
+                                f"{cells4(3, (plat, cat, brand))}</div>"
                             )
                             continue
 
                         parts.append(
                             f"<details><summary><div class='row level-2'>"
                             f"<span><span class='caret'></span> "
-                            f"<span class='name'>{sku_label}</span></span>"
-                            f"{cells4(3, (plat, cat, sku))}</div></summary>"
+                            f"<span class='name'>{brand_label}</span></span>"
+                            f"{cells4(3, (plat, cat, brand))}</div></summary>"
                         )
 
-                        for store in store_series.sort_values(ascending=False).index:
+                        for sku in sku_series.sort_values(ascending=False).index:
+                            sku_label = _strip_pcz(sku)
+                            # Stores under this SKU
+                            store_series = pd.Series(dtype=float)
+                            if has_store and n_levels >= 5 and not main_lv[5].empty:
+                                try:
+                                    store_series = main_lv[5].loc[(plat, cat, brand, sku)]
+                                    if isinstance(store_series, float):
+                                        store_series = pd.Series(dtype=float)
+                                except KeyError:
+                                    pass
+
+                            if store_series.empty:
+                                parts.append(
+                                    f"<div class='row level-3'>"
+                                    f"<span><span class='caret-empty'></span> "
+                                    f"<span class='name'>{sku_label}</span></span>"
+                                    f"{cells4(4, (plat, cat, brand, sku))}</div>"
+                                )
+                                continue
+
                             parts.append(
-                                f"<div class='row level-3'>"
-                                f"<span><span class='caret-empty'></span> "
-                                f"<span class='name'>{_clean_store(store)}</span></span>"
-                                f"{cells4(4, (plat, cat, sku, store))}</div>"
+                                f"<details><summary><div class='row level-3'>"
+                                f"<span><span class='caret'></span> "
+                                f"<span class='name'>{sku_label}</span></span>"
+                                f"{cells4(4, (plat, cat, brand, sku))}</div></summary>"
                             )
+
+                            for store in store_series.sort_values(ascending=False).index:
+                                parts.append(
+                                    f"<div class='row level-4'>"
+                                    f"<span><span class='caret-empty'></span> "
+                                    f"<span class='name'>{_clean_store(store)}</span></span>"
+                                    f"{cells4(5, (plat, cat, brand, sku, store))}</div>"
+                                )
+                            parts.append("</details>")
                         parts.append("</details>")
                     parts.append("</details>")
                 parts.append("</details>")
