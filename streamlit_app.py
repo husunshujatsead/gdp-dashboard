@@ -10,11 +10,15 @@ from __future__ import annotations
 
 import io
 from datetime import date, timedelta
+import datetime as _dt
 
-import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+
+from datetime import timedelta
+import pandas as pd
+import numpy as np
 
 # ---------------------------------------------------------------------------
 # Page config + global CSS (Saudia palette)
@@ -24,6 +28,30 @@ st.set_page_config(
     page_icon="🧊",
     layout="wide",
 )
+
+st.markdown("""
+<style>
+.pivot-wrap table {
+    width: 100%;
+    table-layout: fixed;   /* KEY FIX */
+    border-collapse: collapse;
+}
+
+.pivot-wrap td {
+    padding: 4px 8px;
+}
+
+.row-label {
+    text-align: left;
+}
+
+.num {
+    text-align: right;
+    width: 100px;          /* FIXED WIDTH FOR ALL NUMBERS */
+    white-space: nowrap;
+}
+</style>
+""", unsafe_allow_html=True)
 
 SAUDIA_BLUE = "#009DE0"      # brand bright blue
 NAVY = "#072E73"             # brand navy
@@ -314,6 +342,173 @@ def merge_historic_mtd(hist: pd.DataFrame, mtd: pd.DataFrame) -> pd.DataFrame:
 # Default file paths (when sitting next to the script)
 DEFAULT_HIST = "Online Shopping 24-26 (1).xlsx"
 DEFAULT_MTD  = "Online Shopping MTD (3).xlsx"
+DEFAULT_DATA_DASH = "Sadafco Data Dashboard (1).xlsx"
+DEFAULT_KEETA = "Sadafco Keeta Manual Tracker.xlsx"
+
+
+def _parse_date_raw(v):
+    """Parse a single date value without swapping."""
+    if pd.isna(v):
+        return pd.NaT
+    if isinstance(v, str):
+        return pd.to_datetime(v, dayfirst=True, errors="coerce")
+    if isinstance(v, (_dt.datetime, pd.Timestamp)):
+        return pd.Timestamp(v)
+    return pd.NaT
+
+
+def _fix_dates_column(series: pd.Series) -> pd.Series:
+    """Two-pass fix for mixed Excel date formats."""
+    is_str = series.apply(lambda v: isinstance(v, str))
+    parsed = series.apply(_parse_date_raw)
+    str_months = set(parsed[is_str].dropna().dt.month.unique())
+    if not str_months:
+        return parsed
+    dt_mask = ~is_str & parsed.notna()
+    result = parsed.copy()
+    for idx in result[dt_mask].index:
+        ts = result.at[idx]
+        if ts.month not in str_months and ts.day <= 12 and ts.day in str_months:
+            try:
+                result.at[idx] = pd.Timestamp(year=ts.year, month=ts.day, day=ts.month)
+            except Exception:
+                pass
+    return result
+
+
+@st.cache_data(show_spinner=False)
+def load_pricing(path_or_buffer) -> pd.DataFrame:
+    df = pd.read_excel(path_or_buffer, sheet_name="Price")
+    df.columns = [c.strip() for c in df.columns]
+    df["Date"] = _fix_dates_column(df["Date"])
+    df["Price"] = pd.to_numeric(df["Price"], errors="coerce")
+    return df
+
+
+@st.cache_data(show_spinner=False)
+def load_availability(path_or_buffer) -> pd.DataFrame:
+    df = pd.read_excel(path_or_buffer, sheet_name="Availability")
+    df.columns = [c.strip() for c in df.columns]
+    df["Date"] = _fix_dates_column(df["Date"])
+    df["Availability"] = pd.to_numeric(df["Availability"], errors="coerce")
+    return df
+
+
+@st.cache_data(show_spinner=False)
+def load_keeta_tracker(path_or_buffer) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Load the Keeta Manual Tracker — returns (price_df, avail_df) in the same
+    schema as the main data dashboard file so they can be concatenated."""
+    xl = pd.ExcelFile(path_or_buffer)
+    # Parse locations key — headers are in data row, not header row
+    loc_raw = pd.read_excel(xl, sheet_name="Locations Key", header=None)
+    # Find the row containing "City" to use as header
+    header_row = None
+    for i, row in loc_raw.iterrows():
+        if row.astype(str).str.contains("City", case=False).any():
+            header_row = i
+            break
+    if header_row is not None:
+        loc = loc_raw.iloc[header_row + 1:].copy()
+        loc.columns = loc_raw.iloc[header_row].values
+    else:
+        loc = pd.DataFrame()
+
+    city_map = {}
+    if not loc.empty and "Location Name" in loc.columns and "City" in loc.columns:
+        loc = loc.dropna(subset=["Location Name"])
+        city_map = dict(zip(loc["Location Name"].astype(str).str.strip(),
+                            loc["City"].astype(str).str.strip()))
+
+    rows = []
+    for sheet in xl.sheet_names:
+        if sheet == "Locations Key":
+            continue
+        sdf = pd.read_excel(xl, sheet_name=sheet)
+        sdf.columns = [c.strip() for c in sdf.columns]
+        sdf["Store"] = sheet
+        sdf["City"] = city_map.get(sheet, "Unknown")
+        rows.append(sdf)
+
+    if not rows:
+        return pd.DataFrame(), pd.DataFrame()
+
+    raw = pd.concat(rows, ignore_index=True)
+    raw = raw.dropna(subset=["SKU"])
+
+    # Assign yesterday's date (snapshot date)
+    snap_date = pd.Timestamp(date.today() - timedelta(days=1))
+
+    # Infer Brand from SKU name
+    def _keeta_brand(sku: str) -> str:
+        s = str(sku).lower()
+        if "saudia" in s:
+            return "Saudia"
+        if "nadec" in s:
+            return "Nadec"
+        if "almarai" in s:
+            return "Almarai"
+        if "al safi" in s:
+            return "Al Safi"
+        if "lays" in s:
+            return "Lays"
+        if "al batal" in s:
+            return "Al Batal"
+        if "pringles" in s:
+            return "Pringles"
+        if "baskin" in s:
+            return "Baskin Robbins"
+        if "kwality" in s:
+            return "Kwality"
+        if "nada" in s:
+            return "Nada"
+        if "luna" in s:
+            return "Luna"
+        if "al alali" in s:
+            return "Al Alali"
+        return "Other"
+
+    # Infer Category from SKU name
+    def _keeta_category(sku: str) -> str:
+        s = str(sku).lower()
+        if "milk" in s:
+            return "Milk"
+        if "ice cream" in s or "sandwich" in s:
+            return "Ice Cream"
+        if "tomato paste" in s or "paste" in s:
+            return "Paste"
+        if "ketchup" in s:
+            return "Ketchup"
+        if "yoghurt" in s or "yogurt" in s:
+            return "Yoghurt"
+        if "evaporated" in s:
+            return "Evaporated Milk"
+        if "pizza sauce" in s or "sauce" in s:
+            return "Sauce"
+        if "chips" in s or "rings" in s or "letters" in s or "cheese balls" in s:
+            return "Snacks"
+        return "Other"
+
+    # Determine Brand vs Competitor type
+    def _keeta_type(brand: str) -> str:
+        return "Brand" if brand in ("Saudia", "Crispy") else "Competitor"
+
+    raw["Brand"] = raw["SKU"].apply(_keeta_brand)
+    raw["Category"] = raw["SKU"].apply(_keeta_category)
+    raw["Type"] = raw["Brand"].apply(_keeta_type)
+    raw["Platform"] = "Keeta"
+    raw["Date"] = snap_date
+
+    # Price DataFrame
+    keeta_price = raw[["Date", "Platform", "Brand", "Category", "SKU",
+                       "Store", "City", "Type", "Price"]].copy()
+    keeta_price["Price"] = pd.to_numeric(keeta_price["Price"], errors="coerce")
+
+    # Availability DataFrame
+    keeta_avail = raw[["Date", "Platform", "Brand", "Category", "SKU",
+                       "Store", "City", "Availability"]].copy()
+    keeta_avail["Availability"] = pd.to_numeric(keeta_avail["Availability"], errors="coerce")
+
+    return keeta_price, keeta_avail
 
 # ---------------------------------------------------------------------------
 # Hero header
@@ -322,695 +517,696 @@ st.markdown(
     f"""
     <div class="saudia-hero">
       <div style="text-align:center; width:100%;">
-        <div class="saudia-title">Online Shopping — Sales Dashboard</div>
-        <div class="saudia-sub">Platform-wise & Platform-Category sales pivots, replicated from the SADAFCO tracker.</div>
+        <div class="saudia-title">SADAFCO — Online Shopping Dashboard</div>
+        <div class="saudia-sub">Sales tracker, pricing & availability — all in one place.</div>
       </div>
     </div>
     """,
     unsafe_allow_html=True,
 )
-tab_sales, tab_pricing, tab_availability = st.tabs(["📦 Sales Tracker", "💰 Pricing", "📊 Availability"])
 
 # ---------------------------------------------------------------------------
-# Data source — sidebar with two upload slots
+# Data source — sidebar with all upload slots
 # ---------------------------------------------------------------------------
-with tab_sales:
-    with st.sidebar:
-        st.markdown(f"<h3 style='color:{NAVY_DARK};margin-top:0;'>Data source</h3>", unsafe_allow_html=True)
-        st.caption(
-            "Upload the **historic** file once (Online Shopping 24-26). "
-            "Each week, upload the latest **MTD** file — it replaces the "
-            "overlapping months in the historic data automatically."
-        )
-        hist_upload = st.file_uploader("Historic file (.xlsx)", type=["xlsx"],
-                                       key="hist_upload")
-        mtd_upload  = st.file_uploader("MTD file (.xlsx)", type=["xlsx"],
-                                       key="mtd_upload")
+with st.sidebar:
+    st.markdown(f"<h3 style='color:{NAVY_DARK};margin-top:0;'>Sales Tracker</h3>", unsafe_allow_html=True)
+    st.caption(
+        "Upload the **historic** file once (Online Shopping 24-26). "
+        "Each week, upload the latest **MTD** file — it replaces the "
+        "overlapping months in the historic data automatically."
+    )
+    hist_upload = st.file_uploader("Historic file (.xlsx)", type=["xlsx"],
+                                   key="hist_upload")
+    mtd_upload  = st.file_uploader("MTD file (.xlsx)", type=["xlsx"],
+                                   key="mtd_upload")
+    st.markdown("---")
+    st.markdown(f"<h3 style='color:{NAVY_DARK};margin-top:0;'>Pricing & Availability</h3>", unsafe_allow_html=True)
+    data_dash_upload = st.file_uploader("Data Dashboard file (.xlsx)", type=["xlsx"],
+                                        key="data_dash_upload")
+    keeta_upload = st.file_uploader("Keeta Manual Tracker (.xlsx)", type=["xlsx"],
+                                    key="keeta_upload")
 
-    # --- Load ---
-    hist_df = None
-    mtd_df  = None
+# --- Load sales data ---
+hist_df = None
+mtd_df  = None
+try:
+    hist_src = hist_upload if hist_upload is not None else DEFAULT_HIST
+    hist_df = load_historic(hist_src)
+except Exception:
+    pass
+try:
+    mtd_src = mtd_upload if mtd_upload is not None else DEFAULT_MTD
+    mtd_df = load_mtd(mtd_src)
+except Exception:
+    pass
 
-    try:
-        hist_src = hist_upload if hist_upload is not None else DEFAULT_HIST
-        hist_df = load_historic(hist_src)
-    except Exception:
-        pass
-
-    try:
-        mtd_src = mtd_upload if mtd_upload is not None else DEFAULT_MTD
-        mtd_df = load_mtd(mtd_src)
-    except Exception:
-        pass
-
-    if hist_df is None and mtd_df is None:
-        st.error("No data found. Please upload the historic and/or MTD workbooks via the sidebar.")
-        st.stop()
-
-    if hist_df is not None and mtd_df is not None:
-        df = merge_historic_mtd(hist_df, mtd_df)
-    elif hist_df is not None:
-        df = hist_df
-    else:
-        df = mtd_df
-
-    # Add convenience alias used everywhere downstream
+if hist_df is not None and mtd_df is not None:
+    df = merge_historic_mtd(hist_df, mtd_df)
+elif hist_df is not None:
+    df = hist_df
+elif mtd_df is not None:
+    df = mtd_df
+else:
+    df = None
+if df is not None:
     df["SKU"] = df["SKU_label"]
 
-    # ---------------------------------------------------------------------------
-    # Filter bar (Saudia blue)
-    # ---------------------------------------------------------------------------
-    st.markdown('<div class="filter-bar">', unsafe_allow_html=True)
+# --- Load pricing & availability data ---
+dd_src = data_dash_upload if data_dash_upload is not None else DEFAULT_DATA_DASH
+price_df = None
+avail_df = None
+_dd_load_error = None
+try:
+    price_df = load_pricing(dd_src)
+    avail_df = load_availability(dd_src)
+except Exception as e:
+    _dd_load_error = str(e)
 
-    max_date = df["Date"].max().date() if df["Date"].notna().any() else date.today()
-    min_date = df["Date"].min().date() if df["Date"].notna().any() else max_date - timedelta(days=365)
-
-    # default date range — full span of the data
-    if "df_from" not in st.session_state:
-        st.session_state.df_from = max_date.replace(day=1)
-        st.session_state.df_to   = max_date
-
-    # Row 1 — dropdowns + date pickers
-    c1, c2, c3, c4, c5, c6 = st.columns([1.1, 1.1, 1.1, 1.4, 1, 1])
-    with c1:
-        platforms = ["All"] + sorted(df["Platform"].unique().tolist())
-        f_platform = st.selectbox("Platform", platforms, index=0)
-    with c2:
-        brand_pool = df if f_platform == "All" else df[df["Platform"] == f_platform]
-        brands = ["All"] + sorted(brand_pool["Brand"].dropna().unique().tolist())
-        f_brand = st.selectbox("Brand", brands, index=0)
-    with c3:
-        categories = ["All"] + sorted(df["Category"].unique().tolist())
-        f_category = st.selectbox("Category", categories, index=0)
-    with c4:
-        sku_pool = df.copy()
-        if f_platform != "All": sku_pool = sku_pool[sku_pool["Platform"] == f_platform]
-        if f_brand != "All":    sku_pool = sku_pool[sku_pool["Brand"] == f_brand]
-        if f_category != "All": sku_pool = sku_pool[sku_pool["Category"] == f_category]
-        skus = ["All"] + sorted(sku_pool["SKU"].dropna().unique().tolist())
-        f_sku = st.selectbox("SKU", skus, index=0)
-    with c5:
-        f_date_from = st.date_input("Date from", value=st.session_state.df_from,
-                                    min_value=min_date, max_value=max_date)
-        st.session_state.df_from = f_date_from
-    with c6:
-        f_date_to = st.date_input("Date to", value=st.session_state.df_to,
-                                  min_value=min_date, max_value=max_date)
-        st.session_state.df_to = f_date_to
-
-    st.markdown("</div>", unsafe_allow_html=True)  # /filter-bar
-
-    # ---------------------------------------------------------------------------
-    # Apply filters
-    # ---------------------------------------------------------------------------
-    mask = (df["Date"].dt.date >= f_date_from) & (df["Date"].dt.date <= f_date_to)
-    if f_platform != "All": mask &= df["Platform"] == f_platform
-    if f_brand    != "All": mask &= df["Brand"] == f_brand
-    if f_category != "All": mask &= df["Category"] == f_category
-    if f_sku      != "All": mask &= df["SKU"] == f_sku
-    fdf = df[mask].copy()
-
-    # ---------------------------------------------------------------------------
-    # KPI cards
-    # ---------------------------------------------------------------------------
-    def human(n: float) -> str:
-        a = abs(n)
-        if a >= 1e9: return f"{n/1e9:.2f}B"
-        if a >= 1e6: return f"{n/1e6:.2f}M"
-        if a >= 1e3: return f"{n/1e3:.1f}K"
-        return f"{n:,.0f}"
-
-
-    total_sales = fdf["Sales Val"].sum()
-    total_units = fdf["Sales Qty"].sum()
-    n_platforms = fdf["Platform"].nunique()
-    n_skus = fdf["SKU"].nunique()
-    top_platform = (
-        fdf.groupby("Platform")["Sales Val"].sum().sort_values(ascending=False).index[0]
-        if not fdf.empty else "—"
-    )
-
-    st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
-    k1, k2, k3, k4, k5 = st.columns(5)
-    for col, label, value in [
-        (k1, "Total sales (SAR)", human(total_sales)),
-        (k2, "Units sold",        human(total_units)),
-        (k3, "Platforms",         str(n_platforms)),
-        (k4, "Active SKUs",       str(n_skus)),
-        (k5, "Top platform",      top_platform),
-    ]:
-        col.markdown(
-            f"<div class='kpi-card'><div class='kpi-label'>{label}</div>"
-            f"<div class='kpi-value'>{value}</div></div>",
-            unsafe_allow_html=True,
-        )
-
-    # ---------------------------------------------------------------------------
-    # Charts — monthly trend & platform totals
-    # ---------------------------------------------------------------------------
-    st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
-
-    st.markdown("<div class='sec-title'>Total sales by platform</div>", unsafe_allow_html=True)
-    bars = (fdf.groupby("Platform")["Sales Val"].sum()
-                .sort_values(ascending=True).reset_index())
-    if bars.empty:
-        st.info("No data for the current filters.")
-    else:
-        bar_colors = [PLATFORM_COLORS.get(p, "#9CA3AF") for p in bars["Platform"]]
-        fig = go.Figure(go.Bar(
-            x=bars["Sales Val"], y=bars["Platform"], orientation="h",
-            marker=dict(color=bar_colors),
-            text=[human(v) for v in bars["Sales Val"]],
-            textposition="outside", cliponaxis=False,
-        ))
-        fig.update_layout(
-            height=400, margin=dict(l=10, r=40, t=10, b=10),
-            plot_bgcolor="white",
-            xaxis=dict(gridcolor="#e5e7eb", title="Total sales value (SAR)"),
-            yaxis=dict(title=""),
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-    # Category mix by platform
-    st.markdown("<div class='sec-title'>Category mix by platform</div>", unsafe_allow_html=True)
-    mix = (fdf.groupby(["Platform", "Category"])["Sales Val"].sum().reset_index())
-    if mix.empty:
-        st.info("No data for the current filters.")
-    else:
-        plat_order = (mix.groupby("Platform")["Sales Val"].sum()
-                           .sort_values(ascending=False).index.tolist())
-        fig = px.bar(
-            mix, x="Category", y="Sales Val", color="Platform",
-            color_discrete_map=PLATFORM_COLORS,
-            category_orders={"Platform": plat_order,
-                             "Category": list(CATEGORY_PALETTE.keys())},
-        )
-        fig.update_layout(
-            height=380, margin=dict(l=10, r=10, t=10, b=10),
-            plot_bgcolor="white", barmode="group",
-            yaxis=dict(gridcolor="#e5e7eb", title="Sales value (SAR)"),
-            xaxis=dict(title=""),
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-    # ----- Category × Platform trendline (Top 5 platforms) -----
-    st.markdown("<div class='sec-title'>Category trend by platform — top 5 platforms</div>", unsafe_allow_html=True)
-    st.markdown("<div class='sec-sub'>Monthly sales value split by category, one panel per category, lines colored by platform.</div>", unsafe_allow_html=True)
-    top5 = (fdf.groupby("Platform")["Sales Val"].sum()
-                 .sort_values(ascending=False).head(5).index.tolist())
-    cat_trend = (fdf[fdf["Platform"].isin(top5)]
-                 .groupby(["Platform", "Category", "Month"])["Sales Val"].sum().reset_index())
-    if cat_trend.empty:
-        st.info("No data for the current filters.")
-    else:
-        cat_trend["Month"] = pd.Categorical(cat_trend["Month"], categories=MONTH_ORDER, ordered=True)
-        cat_trend = cat_trend.sort_values("Month")
-        cats_present = [c for c in CATEGORY_PALETTE if c in cat_trend["Category"].unique()]
-        fig = px.line(
-            cat_trend, x="Month", y="Sales Val", color="Platform", markers=True,
-            facet_col="Category", facet_col_wrap=5,
-            color_discrete_map=PLATFORM_COLORS,
-            category_orders={"Platform": top5, "Category": cats_present},
-        )
-        fig.for_each_annotation(lambda a: a.update(text=a.text.split("=")[-1],
-                                                   font=dict(size=13, color=NAVY_DARK)))
-        fig.update_yaxes(matches=None, showticklabels=True, gridcolor="#e5e7eb", title="")
-        fig.update_xaxes(title="")
-        fig.update_layout(
-            height=340, margin=dict(l=10, r=10, t=40, b=10),
-            plot_bgcolor="white", legend_title_text="Platform",
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-    # ---------------------------------------------------------------------------
-    # Year-over-Year comparison — driven by the date-range filter
-    # ---------------------------------------------------------------------------
-    # Determine which months the user selected via the date picker
-    _sel_months: list[tuple[int, int]] = []  # (year, month_num) pairs from filter
-    if fdf["Date"].notna().any():
-        _sel_ym = fdf[["Year", "MonthNum"]].drop_duplicates()
-        _sel_months = list(zip(_sel_ym["Year"].astype(int), _sel_ym["MonthNum"].astype(int)))
-        _sel_months.sort()
-
-    # We only compare months from the *latest year* in the selection against the prior year
-    _sel_years = sorted(set(y for y, _ in _sel_months))
-    if _sel_years:
-        cy_year = _sel_years[-1]
-        py_year = cy_year - 1
-        cy_month_nums = sorted(set(mn for y, mn in _sel_months if y == cy_year))
-    else:
-        cy_year = None
-        py_year = None
-        cy_month_nums = []
-
-    # Base data — respects Platform/Brand/Category/SKU filters but NOT date range
-    yoy_base = df.copy()
-    if f_platform != "All": yoy_base = yoy_base[yoy_base["Platform"] == f_platform]
-    if f_brand    != "All": yoy_base = yoy_base[yoy_base["Brand"] == f_brand]
-    if f_category != "All": yoy_base = yoy_base[yoy_base["Category"] == f_category]
-    if f_sku      != "All": yoy_base = yoy_base[yoy_base["SKU"] == f_sku]
-
-    yoy_rows: list[dict] = []
-
-    has_py = cy_year is not None and py_year in yoy_base["Year"].unique()
-
-    if not cy_month_nums:
-        pass  # nothing selected — skip silently
-    elif not has_py:
-        st.markdown("<div class='sec-title' style='margin-top:28px;'>Year-over-Year comparison</div>", unsafe_allow_html=True)
-        st.info(f"No {py_year} data available to compare against.")
-    else:
-        st.markdown("<div class='sec-title' style='margin-top:28px;'>Year-over-Year comparison</div>", unsafe_allow_html=True)
-        st.markdown(
-            "<div class='sec-sub'>Comparing each selected month of the current year against the "
-            "same month of the prior year. Partial months are day-matched automatically.</div>",
-            unsafe_allow_html=True,
-        )
-
-        cy_months_abr = [MONTH_NUM_TO_ABR[mn] for mn in cy_month_nums
-                         if mn in MONTH_NUM_TO_ABR]
-
-        for m in cy_months_abr:
-            cy_slice = yoy_base[(yoy_base["Year"] == cy_year) & (yoy_base["Month"] == m)]
-            if cy_slice.empty:
-                continue
-            max_day = int(cy_slice["Day"].max())
-            py_slice = yoy_base[(yoy_base["Year"] == py_year) &
-                                (yoy_base["Month"] == m) &
-                                (yoy_base["Day"] <= max_day)]
-            cy_val = float(cy_slice["Sales Val"].sum())
-            py_val = float(py_slice["Sales Val"].sum())
-            delta = cy_val - py_val
-            pct = (delta / py_val * 100) if py_val else None
-            yoy_rows.append({
-                "Month": m, "Window": f"1–{max_day}",
-                f"{cy_year}": cy_val, f"{py_year}": py_val,
-                "Δ SAR": delta, "Δ %": pct,
-            })
-
-        if not yoy_rows:
-            st.info("No overlapping months between current and prior year under the current filters.")
+# --- Load Keeta tracker and merge ---
+keeta_src = keeta_upload if keeta_upload is not None else DEFAULT_KEETA
+try:
+    keeta_price, keeta_avail = load_keeta_tracker(keeta_src)
+    if not keeta_price.empty:
+        if price_df is not None:
+            # Align columns — keep only common columns
+            common_pr = [c for c in price_df.columns if c in keeta_price.columns]
+            price_df = pd.concat([price_df[common_pr], keeta_price[common_pr]], ignore_index=True)
         else:
-            # --- summary table ---
-            def fmt_pct(p):
-                if p is None or pd.isna(p):
-                    return "<span style='color:#9ca3af'>—</span>"
-                arrow = "▲" if p >= 0 else "▼"
-                color = "#00A651" if p >= 0 else "#E00034"
-                return f"<span style='color:{color};font-weight:700'>{arrow} {p:+.1f}%</span>"
+            price_df = keeta_price
+    if not keeta_avail.empty:
+        if avail_df is not None:
+            common_av = [c for c in avail_df.columns if c in keeta_avail.columns]
+            avail_df = pd.concat([avail_df[common_av], keeta_avail[common_av]], ignore_index=True)
+        else:
+            avail_df = keeta_avail
+except Exception:
+    pass  # Keeta file is optional
 
-            def fmt_delta(v):
-                if v == 0 or pd.isna(v):
-                    return "<span style='color:#9ca3af'>—</span>"
-                color = "#00A651" if v >= 0 else "#E00034"
-                sign = "+" if v > 0 else "−"
-                return f"<span style='color:{color};font-weight:700'>{sign}{human(abs(v))}</span>"
+# ---------------------------------------------------------------------------
+# TABS
+# ---------------------------------------------------------------------------
+tab_sales, tab_pricing, tab_availability = st.tabs(["📊 Sales Tracker", "💲 Pricing", "📦 Availability"])
 
-            head = (f"<thead><tr>"
-                    f"<th>Month</th><th>Window</th>"
-                    f"<th>{cy_year}</th><th>{py_year}</th>"
-                    f"<th>Δ SAR</th><th>Δ %</th></tr></thead>")
-            body = []
-            for r in yoy_rows:
-                body.append(
-                    "<tr>"
-                    f"<td class='row-label'>{r['Month']}</td>"
-                    f"<td class='num'>{r['Window']}</td>"
-                    f"<td class='num'>{human(r[str(cy_year)])}</td>"
-                    f"<td class='num'>{human(r[str(py_year)])}</td>"
-                    f"<td class='num'>{fmt_delta(r['Δ SAR'])}</td>"
-                    f"<td class='num'>{fmt_pct(r['Δ %'])}</td>"
-                    "</tr>"
-                )
-            st.markdown(
-                f"<div class='pivot-wrap'><table>{head}<tbody>{''.join(body)}</tbody></table></div>",
+
+# ===========================================================================
+# TAB 1 — SALES TRACKER
+# ===========================================================================
+with tab_sales:
+    if df is None:
+        st.info("No sales data found. Upload the historic and/or MTD workbooks via the sidebar.")
+    else:
+        # ---------------------------------------------------------------------------
+        # Filter bar (Saudia blue)
+        # ---------------------------------------------------------------------------
+        st.markdown('<div class="filter-bar">', unsafe_allow_html=True)
+
+        max_date = df["Date"].max().date() if df["Date"].notna().any() else date.today()
+        min_date = df["Date"].min().date() if df["Date"].notna().any() else max_date - timedelta(days=365)
+
+        # default date range — full span of the data
+        if "df_from" not in st.session_state:
+            st.session_state.df_from = min_date
+            st.session_state.df_to   = max_date
+
+        # Row 1 — dropdowns + date pickers
+        c1, c2, c3, c4, c5, c6 = st.columns([1.1, 1.1, 1.1, 1.4, 1, 1])
+        with c1:
+            platforms = ["All"] + sorted(df["Platform"].unique().tolist())
+            f_platform = st.selectbox("Platform", platforms, index=0)
+        with c2:
+            brand_pool = df if f_platform == "All" else df[df["Platform"] == f_platform]
+            brands = ["All"] + sorted(brand_pool["Brand"].dropna().unique().tolist())
+            f_brand = st.selectbox("Brand", brands, index=0)
+        with c3:
+            categories = ["All"] + sorted(df["Category"].unique().tolist())
+            f_category = st.selectbox("Category", categories, index=0)
+        with c4:
+            sku_pool = df.copy()
+            if f_platform != "All": sku_pool = sku_pool[sku_pool["Platform"] == f_platform]
+            if f_brand != "All":    sku_pool = sku_pool[sku_pool["Brand"] == f_brand]
+            if f_category != "All": sku_pool = sku_pool[sku_pool["Category"] == f_category]
+            skus = ["All"] + sorted(sku_pool["SKU"].dropna().unique().tolist())
+            f_sku = st.selectbox("SKU", skus, index=0)
+        with c5:
+            f_date_from = st.date_input("Date from", value=st.session_state.df_from,
+                                        min_value=min_date, max_value=max_date)
+            st.session_state.df_from = f_date_from
+        with c6:
+            f_date_to = st.date_input("Date to", value=st.session_state.df_to,
+                                      min_value=min_date, max_value=max_date)
+            st.session_state.df_to = f_date_to
+
+        st.markdown("</div>", unsafe_allow_html=True)  # /filter-bar
+
+        # ---------------------------------------------------------------------------
+        # Apply filters
+        # ---------------------------------------------------------------------------
+        mask = (df["Date"].dt.date >= f_date_from) & (df["Date"].dt.date <= f_date_to)
+        if f_platform != "All": mask &= df["Platform"] == f_platform
+        if f_brand    != "All": mask &= df["Brand"] == f_brand
+        if f_category != "All": mask &= df["Category"] == f_category
+        if f_sku      != "All": mask &= df["SKU"] == f_sku
+        fdf = df[mask].copy()
+
+        # ---------------------------------------------------------------------------
+        # KPI cards
+        # ---------------------------------------------------------------------------
+        def human(n: float) -> str:
+            a = abs(n)
+            if a >= 1e9: return f"{n/1e9:.2f}B"
+            if a >= 1e6: return f"{n/1e6:.2f}M"
+            if a >= 1e3: return f"{n/1e3:.1f}K"
+            return f"{n:,.0f}"
+
+
+        total_sales = fdf["Sales Val"].sum()
+        total_units = fdf["Sales Qty"].sum()
+        n_platforms = fdf["Platform"].nunique()
+        n_skus = fdf["SKU"].nunique()
+        top_platform = (
+            fdf.groupby("Platform")["Sales Val"].sum().sort_values(ascending=False).index[0]
+            if not fdf.empty else "—"
+        )
+
+        st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
+        k1, k2, k3, k4, k5 = st.columns(5)
+        for col, label, value in [
+            (k1, "Total sales (SAR)", human(total_sales)),
+            (k2, "Units sold",        human(total_units)),
+            (k3, "Platforms",         str(n_platforms)),
+            (k4, "Active SKUs",       str(n_skus)),
+            (k5, "Top platform",      top_platform),
+        ]:
+            col.markdown(
+                f"<div class='kpi-card'><div class='kpi-label'>{label}</div>"
+                f"<div class='kpi-value'>{value}</div></div>",
                 unsafe_allow_html=True,
             )
 
-            # --- YoY by platform chart for EACH selected month ---
-            for row in yoy_rows:
-                m = row["Month"]
-                cy_slice = yoy_base[(yoy_base["Year"] == cy_year) & (yoy_base["Month"] == m)]
-                max_day = int(cy_slice["Day"].max())
+        # ---------------------------------------------------------------------------
+        # Charts — monthly trend & platform totals
+        # ---------------------------------------------------------------------------
+        st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
 
-                cy_plat = cy_slice.groupby("Platform")["Sales Val"].sum()
-                py_plat = (yoy_base[(yoy_base["Year"] == py_year) &
+        st.markdown("<div class='sec-title'>Total sales by platform</div>", unsafe_allow_html=True)
+        bars = (fdf.groupby("Platform")["Sales Val"].sum()
+                    .sort_values(ascending=True).reset_index())
+        if bars.empty:
+            st.info("No data for the current filters.")
+        else:
+            bar_colors = [PLATFORM_COLORS.get(p, "#9CA3AF") for p in bars["Platform"]]
+            fig = go.Figure(go.Bar(
+                x=bars["Sales Val"], y=bars["Platform"], orientation="h",
+                marker=dict(color=bar_colors),
+                text=[human(v) for v in bars["Sales Val"]],
+                textposition="outside", cliponaxis=False,
+            ))
+            fig.update_layout(
+                height=400, margin=dict(l=10, r=40, t=10, b=10),
+                plot_bgcolor="white",
+                xaxis=dict(gridcolor="#e5e7eb", title="Total sales value (SAR)"),
+                yaxis=dict(title=""),
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+        # Category mix by platform
+        st.markdown("<div class='sec-title'>Category mix by platform</div>", unsafe_allow_html=True)
+        mix = (fdf.groupby(["Platform", "Category"])["Sales Val"].sum().reset_index())
+        if mix.empty:
+            st.info("No data for the current filters.")
+        else:
+            plat_order = (mix.groupby("Platform")["Sales Val"].sum()
+                               .sort_values(ascending=False).index.tolist())
+            fig = px.bar(
+                mix, x="Category", y="Sales Val", color="Platform",
+                color_discrete_map=PLATFORM_COLORS,
+                category_orders={"Platform": plat_order,
+                                 "Category": list(CATEGORY_PALETTE.keys())},
+            )
+            fig.update_layout(
+                height=380, margin=dict(l=10, r=10, t=10, b=10),
+                plot_bgcolor="white", barmode="group",
+                yaxis=dict(gridcolor="#e5e7eb", title="Sales value (SAR)"),
+                xaxis=dict(title=""),
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+        # ----- Category × Platform trendline (Top 5 platforms) -----
+        st.markdown("<div class='sec-title'>Category trend by platform — top 5 platforms</div>", unsafe_allow_html=True)
+        st.markdown("<div class='sec-sub'>Monthly sales value split by category, one panel per category, lines colored by platform.</div>", unsafe_allow_html=True)
+        top5 = (fdf.groupby("Platform")["Sales Val"].sum()
+                     .sort_values(ascending=False).head(5).index.tolist())
+        cat_trend = (fdf[fdf["Platform"].isin(top5)]
+                     .groupby(["Platform", "Category", "Month"])["Sales Val"].sum().reset_index())
+        if cat_trend.empty:
+            st.info("No data for the current filters.")
+        else:
+            cat_trend["Month"] = pd.Categorical(cat_trend["Month"], categories=MONTH_ORDER, ordered=True)
+            cat_trend = cat_trend.sort_values("Month")
+            cats_present = [c for c in CATEGORY_PALETTE if c in cat_trend["Category"].unique()]
+            fig = px.line(
+                cat_trend, x="Month", y="Sales Val", color="Platform", markers=True,
+                facet_col="Category", facet_col_wrap=5,
+                color_discrete_map=PLATFORM_COLORS,
+                category_orders={"Platform": top5, "Category": cats_present},
+            )
+            fig.for_each_annotation(lambda a: a.update(text=a.text.split("=")[-1],
+                                                       font=dict(size=13, color=NAVY_DARK)))
+            fig.update_yaxes(matches=None, showticklabels=True, gridcolor="#e5e7eb", title="")
+            fig.update_xaxes(title="")
+            fig.update_layout(
+                height=340, margin=dict(l=10, r=10, t=40, b=10),
+                plot_bgcolor="white", legend_title_text="Platform",
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+        # ---------------------------------------------------------------------------
+        # Year-over-Year comparison — driven by the date-range filter
+        # ---------------------------------------------------------------------------
+        # Determine which months the user selected via the date picker
+        _sel_months: list[tuple[int, int]] = []  # (year, month_num) pairs from filter
+        if fdf["Date"].notna().any():
+            _sel_ym = fdf[["Year", "MonthNum"]].drop_duplicates()
+            _sel_months = list(zip(_sel_ym["Year"].astype(int), _sel_ym["MonthNum"].astype(int)))
+            _sel_months.sort()
+
+        # We only compare months from the *latest year* in the selection against the prior year
+        _sel_years = sorted(set(y for y, _ in _sel_months))
+        if _sel_years:
+            cy_year = _sel_years[-1]
+            py_year = cy_year - 1
+            cy_month_nums = sorted(set(mn for y, mn in _sel_months if y == cy_year))
+        else:
+            cy_year = None
+            py_year = None
+            cy_month_nums = []
+
+        # Base data — respects Platform/Brand/Category/SKU filters but NOT date range
+        yoy_base = df.copy()
+        if f_platform != "All": yoy_base = yoy_base[yoy_base["Platform"] == f_platform]
+        if f_brand    != "All": yoy_base = yoy_base[yoy_base["Brand"] == f_brand]
+        if f_category != "All": yoy_base = yoy_base[yoy_base["Category"] == f_category]
+        if f_sku      != "All": yoy_base = yoy_base[yoy_base["SKU"] == f_sku]
+
+        yoy_rows: list[dict] = []
+
+        has_py = cy_year is not None and py_year in yoy_base["Year"].unique()
+
+        if not cy_month_nums:
+            pass  # nothing selected — skip silently
+        elif not has_py:
+            st.markdown("<div class='sec-title' style='margin-top:28px;'>Year-over-Year comparison</div>", unsafe_allow_html=True)
+            st.info(f"No {py_year} data available to compare against.")
+        else:
+            st.markdown("<div class='sec-title' style='margin-top:28px;'>Year-over-Year comparison</div>", unsafe_allow_html=True)
+            st.markdown(
+                "<div class='sec-sub'>Comparing each selected month of the current year against the "
+                "same month of the prior year. Partial months are day-matched automatically.</div>",
+                unsafe_allow_html=True,
+            )
+
+            cy_months_abr = [MONTH_NUM_TO_ABR[mn] for mn in cy_month_nums
+                             if mn in MONTH_NUM_TO_ABR]
+
+            for m in cy_months_abr:
+                cy_slice = yoy_base[(yoy_base["Year"] == cy_year) & (yoy_base["Month"] == m)]
+                if cy_slice.empty:
+                    continue
+                max_day = int(cy_slice["Day"].max())
+                py_slice = yoy_base[(yoy_base["Year"] == py_year) &
                                     (yoy_base["Month"] == m) &
                                     (yoy_base["Day"] <= max_day)]
-                           .groupby("Platform")["Sales Val"].sum())
+                cy_val = float(cy_slice["Sales Val"].sum())
+                py_val = float(py_slice["Sales Val"].sum())
+                delta = cy_val - py_val
+                pct = (delta / py_val * 100) if py_val else None
+                yoy_rows.append({
+                    "Month": m, "Window": f"1–{max_day}",
+                    f"{cy_year}": cy_val, f"{py_year}": py_val,
+                    "Δ SAR": delta, "Δ %": pct,
+                })
 
-                plat_df = pd.DataFrame({f"{cy_year}": cy_plat, f"{py_year}": py_plat}).fillna(0)
-                plat_df = plat_df.loc[plat_df.sum(axis=1).sort_values(ascending=False).index]
+            if not yoy_rows:
+                st.info("No overlapping months between current and prior year under the current filters.")
+            else:
+                # --- summary table ---
+                def fmt_pct(p):
+                    if p is None or pd.isna(p):
+                        return "<span style='color:#9ca3af'>—</span>"
+                    arrow = "▲" if p >= 0 else "▼"
+                    color = "#00A651" if p >= 0 else "#E00034"
+                    return f"<span style='color:{color};font-weight:700'>{arrow} {p:+.1f}%</span>"
 
-                if plat_df.empty:
-                    continue
+                def fmt_delta(v):
+                    if v == 0 or pd.isna(v):
+                        return "<span style='color:#9ca3af'>—</span>"
+                    color = "#00A651" if v >= 0 else "#E00034"
+                    sign = "+" if v > 0 else "−"
+                    return f"<span style='color:{color};font-weight:700'>{sign}{human(abs(v))}</span>"
+
+                head = (f"<thead><tr>"
+                        f"<th>Month</th><th>Window</th>"
+                        f"<th>{cy_year}</th><th>{py_year}</th>"
+                        f"<th>Δ SAR</th><th>Δ %</th></tr></thead>")
+                body = []
+                for r in yoy_rows:
+                    body.append(
+                        "<tr>"
+                        f"<td class='row-label'>{r['Month']}</td>"
+                        f"<td class='num'>{r['Window']}</td>"
+                        f"<td class='num'>{human(r[str(cy_year)])}</td>"
+                        f"<td class='num'>{human(r[str(py_year)])}</td>"
+                        f"<td class='num'>{fmt_delta(r['Δ SAR'])}</td>"
+                        f"<td class='num'>{fmt_pct(r['Δ %'])}</td>"
+                        "</tr>"
+                    )
                 st.markdown(
-                    f"<div class='sec-title' style='margin-top:18px;'>{m} YoY by platform "
-                    f"<span style='font-size:13px;color:{MUTED};font-weight:500'>(1–{max_day}, "
-                    f"{cy_year} vs {py_year})</span></div>",
+                    f"<div class='pivot-wrap'><table>{head}<tbody>{''.join(body)}</tbody></table></div>",
                     unsafe_allow_html=True,
                 )
-                fig = go.Figure()
-                py_colors = [PLATFORM_COLORS.get(p, "#9CA3AF") for p in plat_df.index]
-                cy_colors = [PLATFORM_COLORS.get(p, "#9CA3AF") for p in plat_df.index]
-                fig.add_bar(name=str(py_year), x=plat_df.index, y=plat_df[str(py_year)],
-                            marker_color=py_colors, marker_opacity=0.45,
-                            text=[human(v) for v in plat_df[str(py_year)]], textposition="outside")
-                fig.add_bar(name=str(cy_year), x=plat_df.index, y=plat_df[str(cy_year)],
-                            marker_color=cy_colors,
-                            text=[human(v) for v in plat_df[str(cy_year)]], textposition="outside")
-                fig.update_layout(
-                    barmode="group", height=400,
-                    margin=dict(l=10, r=10, t=10, b=10), plot_bgcolor="white",
-                    yaxis=dict(gridcolor="#e5e7eb", title="Sales value (SAR)"),
-                    xaxis=dict(title=""), legend_title_text="Year",
-                )
-                st.plotly_chart(fig, use_container_width=True)
 
-                # --- Platform × Category YoY breakdown ---
-                cy_pc = (cy_slice.groupby(["Platform", "Category"])["Sales Val"].sum()
-                         .reset_index().rename(columns={"Sales Val": "CY"}))
-                py_pc_slice = yoy_base[(yoy_base["Year"] == py_year) &
-                                       (yoy_base["Month"] == m) &
-                                       (yoy_base["Day"] <= max_day)]
-                py_pc = (py_pc_slice.groupby(["Platform", "Category"])["Sales Val"].sum()
-                         .reset_index().rename(columns={"Sales Val": "PY"}))
-                pc_merged = pd.merge(cy_pc, py_pc, on=["Platform", "Category"], how="outer").fillna(0)
-                pc_merged["Δ SAR"] = pc_merged["CY"] - pc_merged["PY"]
-                pc_merged["Growth %"] = pc_merged.apply(
-                    lambda r: (r["Δ SAR"] / r["PY"] * 100) if r["PY"] != 0 else None, axis=1)
-                # Sort by CY desc
-                pc_merged = pc_merged.sort_values("CY", ascending=False)
+                # --- YoY by platform chart for EACH selected month ---
+                for row in yoy_rows:
+                    m = row["Month"]
+                    cy_slice = yoy_base[(yoy_base["Year"] == cy_year) & (yoy_base["Month"] == m)]
+                    max_day = int(cy_slice["Day"].max())
 
-                if not pc_merged.empty:
+                    cy_plat = cy_slice.groupby("Platform")["Sales Val"].sum()
+                    py_plat = (yoy_base[(yoy_base["Year"] == py_year) &
+                                        (yoy_base["Month"] == m) &
+                                        (yoy_base["Day"] <= max_day)]
+                               .groupby("Platform")["Sales Val"].sum())
+
+                    plat_df = pd.DataFrame({f"{cy_year}": cy_plat, f"{py_year}": py_plat}).fillna(0)
+                    plat_df = plat_df.loc[plat_df.sum(axis=1).sort_values(ascending=False).index]
+
+                    if plat_df.empty:
+                        continue
                     st.markdown(
-                        f"<div class='sec-title' style='margin-top:14px;font-size:18px;'>{m} YoY — Platform × Category "
+                        f"<div class='sec-title' style='margin-top:18px;'>{m} YoY by platform "
                         f"<span style='font-size:13px;color:{MUTED};font-weight:500'>(1–{max_day}, "
                         f"{cy_year} vs {py_year})</span></div>",
                         unsafe_allow_html=True,
                     )
-                    pc_head = (f"<thead><tr><th>Platform</th><th>Category</th>"
-                               f"<th>{cy_year}</th><th>{py_year}</th>"
-                               f"<th>Δ SAR</th><th>Growth %</th></tr></thead>")
-                    pc_body = []
-                    for _, r in pc_merged.iterrows():
-                        pc_body.append(
-                            "<tr>"
-                            f"<td class='row-label'>{r['Platform']}</td>"
-                            f"<td class='row-label'>{r['Category']}</td>"
-                            f"<td class='num'>{human(r['CY'])}</td>"
-                            f"<td class='num'>{human(r['PY'])}</td>"
-                            f"<td class='num'>{fmt_delta(r['Δ SAR'])}</td>"
-                            f"<td class='num'>{fmt_pct(r['Growth %'])}</td>"
-                            "</tr>"
-                        )
-                    st.markdown(
-                        f"<div class='pivot-wrap'><table>{pc_head}<tbody>{''.join(pc_body)}</tbody></table></div>",
-                        unsafe_allow_html=True,
+                    fig = go.Figure()
+                    py_colors = [PLATFORM_COLORS.get(p, "#9CA3AF") for p in plat_df.index]
+                    cy_colors = [PLATFORM_COLORS.get(p, "#9CA3AF") for p in plat_df.index]
+                    fig.add_bar(name=str(py_year), x=plat_df.index, y=plat_df[str(py_year)],
+                                marker_color=py_colors, marker_opacity=0.45,
+                                text=[human(v) for v in plat_df[str(py_year)]], textposition="outside")
+                    fig.add_bar(name=str(cy_year), x=plat_df.index, y=plat_df[str(cy_year)],
+                                marker_color=cy_colors,
+                                text=[human(v) for v in plat_df[str(cy_year)]], textposition="outside")
+                    fig.update_layout(
+                        barmode="group", height=400,
+                        margin=dict(l=10, r=10, t=10, b=10), plot_bgcolor="white",
+                        yaxis=dict(gridcolor="#e5e7eb", title="Sales value (SAR)"),
+                        xaxis=dict(title=""), legend_title_text="Year",
                     )
+                    st.plotly_chart(fig, use_container_width=True)
 
-    # ---------------------------------------------------------------------------
-    # Pivot tables (navy-headered, styled HTML)
-    # ---------------------------------------------------------------------------
-    def fmt_cell(v):
-        if pd.isna(v) or v == 0:
-            return "<span style='color:#9ca3af'>—</span>"
-        return f"<span class='num'>{human(v)}</span>"
+                    # --- Platform × Category YoY breakdown ---
+                    cy_pc = (cy_slice.groupby(["Platform", "Category"])["Sales Val"].sum()
+                             .reset_index().rename(columns={"Sales Val": "CY"}))
+                    py_pc_slice = yoy_base[(yoy_base["Year"] == py_year) &
+                                           (yoy_base["Month"] == m) &
+                                           (yoy_base["Day"] <= max_day)]
+                    py_pc = (py_pc_slice.groupby(["Platform", "Category"])["Sales Val"].sum()
+                             .reset_index().rename(columns={"Sales Val": "PY"}))
+                    pc_merged = pd.merge(cy_pc, py_pc, on=["Platform", "Category"], how="outer").fillna(0)
+                    pc_merged["Δ SAR"] = pc_merged["CY"] - pc_merged["PY"]
+                    pc_merged["Growth %"] = pc_merged.apply(
+                        lambda r: (r["Δ SAR"] / r["PY"] * 100) if r["PY"] != 0 else None, axis=1)
+                    # Sort by CY desc
+                    pc_merged = pc_merged.sort_values("CY", ascending=False)
+
+                    if not pc_merged.empty:
+                        st.markdown(
+                            f"<div class='sec-title' style='margin-top:14px;font-size:18px;'>{m} YoY — Platform × Category "
+                            f"<span style='font-size:13px;color:{MUTED};font-weight:500'>(1–{max_day}, "
+                            f"{cy_year} vs {py_year})</span></div>",
+                            unsafe_allow_html=True,
+                        )
+                        pc_head = (f"<thead><tr><th>Platform</th><th>Category</th>"
+                                   f"<th>{cy_year}</th><th>{py_year}</th>"
+                                   f"<th>Δ SAR</th><th>Growth %</th></tr></thead>")
+                        pc_body = []
+                        for _, r in pc_merged.iterrows():
+                            pc_body.append(
+                                "<tr>"
+                                f"<td class='row-label'>{r['Platform']}</td>"
+                                f"<td class='row-label'>{r['Category']}</td>"
+                                f"<td class='num'>{human(r['CY'])}</td>"
+                                f"<td class='num'>{human(r['PY'])}</td>"
+                                f"<td class='num'>{fmt_delta(r['Δ SAR'])}</td>"
+                                f"<td class='num'>{fmt_pct(r['Growth %'])}</td>"
+                                "</tr>"
+                            )
+                        st.markdown(
+                            f"<div class='pivot-wrap'><table>{pc_head}<tbody>{''.join(pc_body)}</tbody></table></div>",
+                            unsafe_allow_html=True,
+                        )
+
+        # ---------------------------------------------------------------------------
+        # Pivot tables (navy-headered, styled HTML)
+        # ---------------------------------------------------------------------------
+        def fmt_cell(v):
+            if pd.isna(v) or v == 0:
+                return "<span style='color:#9ca3af'>—</span>"
+            return f"<span class='num'>{human(v)}</span>"
 
 
-    def render_pivot(pv: pd.DataFrame, index_cols: list[str]) -> str:
-        """Render a pivot DataFrame as HTML with navy headers."""
-        months_present = [m for m in MONTH_ORDER if m in pv.columns]
-        pv = pv[months_present]
-        head = "<thead><tr>" + "".join(f"<th>{c}</th>" for c in index_cols) + \
-               "".join(f"<th>{m}</th>" for m in months_present) + "</tr></thead>"
-        body_rows = []
-        for idx, row in pv.iterrows():
-            if isinstance(idx, tuple):
-                idx_cells = "".join(f"<td class='row-label'>{i}</td>" for i in idx)
-            else:
-                idx_cells = f"<td class='row-label'>{idx}</td>"
-            cells = "".join(f"<td class='num'>{fmt_cell(row[m])}</td>" for m in months_present)
-            body_rows.append(f"<tr>{idx_cells}{cells}</tr>")
-        return f"<div class='pivot-wrap'><table>{head}<tbody>{''.join(body_rows)}</tbody></table></div>"
+        def render_pivot(pv: pd.DataFrame, index_cols: list[str]) -> str:
+            """Render a pivot DataFrame as HTML with navy headers."""
+            months_present = [m for m in MONTH_ORDER if m in pv.columns]
+            pv = pv[months_present]
+            head = "<thead><tr>" + "".join(f"<th>{c}</th>" for c in index_cols) + \
+                   "".join(f"<th>{m}</th>" for m in months_present) + "</tr></thead>"
+            body_rows = []
+            for idx, row in pv.iterrows():
+                if isinstance(idx, tuple):
+                    idx_cells = "".join(f"<td class='row-label'>{i}</td>" for i in idx)
+                else:
+                    idx_cells = f"<td class='row-label'>{idx}</td>"
+                cells = "".join(f"<td class='num'>{fmt_cell(row[m])}</td>" for m in months_present)
+                body_rows.append(f"<tr>{idx_cells}{cells}</tr>")
+            return f"<div class='pivot-wrap'><table>{head}<tbody>{''.join(body_rows)}</tbody></table></div>"
 
 
-    # ----- Platform × Month -----
-    st.markdown(f"<h2 class='sec-title' style='margin-top:28px;'>Platform Wise Sales</h2>", unsafe_allow_html=True)
-    st.markdown("<div class='sec-sub'>Sum of Sales Val by Platform × Month</div>", unsafe_allow_html=True)
+        # ----- Platform × Month -----
+        st.markdown(f"<h2 class='sec-title' style='margin-top:28px;'>Platform Wise Sales</h2>", unsafe_allow_html=True)
+        st.markdown("<div class='sec-sub'>Sum of Sales Val by Platform × Month</div>", unsafe_allow_html=True)
 
-    # Build a base that respects dropdown filters but NOT the date range
-    pivot_base = df.copy()
-    if f_platform != "All": pivot_base = pivot_base[pivot_base["Platform"] == f_platform]
-    if f_brand    != "All": pivot_base = pivot_base[pivot_base["Brand"] == f_brand]
-    if f_category != "All": pivot_base = pivot_base[pivot_base["Category"] == f_category]
-    if f_sku      != "All": pivot_base = pivot_base[pivot_base["SKU"] == f_sku]
+        # Build a base that respects dropdown filters but NOT the date range
+        pivot_base = df.copy()
+        if f_platform != "All": pivot_base = pivot_base[pivot_base["Platform"] == f_platform]
+        if f_brand    != "All": pivot_base = pivot_base[pivot_base["Brand"] == f_brand]
+        if f_category != "All": pivot_base = pivot_base[pivot_base["Category"] == f_category]
+        if f_sku      != "All": pivot_base = pivot_base[pivot_base["SKU"] == f_sku]
 
-    available_years = sorted(pivot_base["Year"].dropna().unique().astype(int), reverse=True)
-    all_platforms = sorted(pivot_base["Platform"].dropna().unique().tolist())
-    all_categories = sorted(pivot_base["Category"].dropna().unique().tolist())
+        available_years = sorted(pivot_base["Year"].dropna().unique().astype(int), reverse=True)
+        all_platforms = sorted(pivot_base["Platform"].dropna().unique().tolist())
+        all_categories = sorted(pivot_base["Category"].dropna().unique().tolist())
 
-    pv_col1, pv_col2 = st.columns(2)
-    with pv_col1:
-        pv1a, pv1b = st.columns(2)
-        with pv1a:
-            pv1_year = st.selectbox("Year", available_years, index=0, key="pv1_year")
-        with pv1b:
-            pv1_months_in_year = [m for m in MONTH_ORDER
-                                  if not pivot_base[(pivot_base["Year"] == pv1_year) &
-                                                    (pivot_base["Month"] == m)].empty]
-            pv1_month_opts = ["All"] + pv1_months_in_year
-            pv1_month = st.selectbox("Month", pv1_month_opts, index=0, key="pv1_month")
-    with pv_col2:
-        pv1_platforms = st.multiselect("Platforms", all_platforms, default=all_platforms, key="pv1_plat")
+        pv_col1, pv_col2 = st.columns(2)
+        with pv_col1:
+            pv1a, pv1b = st.columns(2)
+            with pv1a:
+                pv1_year = st.selectbox("Year", available_years, index=0, key="pv1_year")
+            with pv1b:
+                pv1_months_in_year = [m for m in MONTH_ORDER
+                                      if not pivot_base[(pivot_base["Year"] == pv1_year) &
+                                                        (pivot_base["Month"] == m)].empty]
+                pv1_month_opts = ["All"] + pv1_months_in_year
+                pv1_month = st.selectbox("Month", pv1_month_opts, index=0, key="pv1_month")
+        with pv_col2:
+            pv1_platforms = st.multiselect("Platforms", all_platforms, default=all_platforms, key="pv1_plat")
 
-    pv1_data = pivot_base[pivot_base["Year"] == pv1_year]
-    if pv1_month != "All":
-        pv1_data = pv1_data[pv1_data["Month"] == pv1_month]
-    if pv1_platforms:
-        pv1_data = pv1_data[pv1_data["Platform"].isin(pv1_platforms)]
+        pv1_data = pivot_base[pivot_base["Year"] == pv1_year]
+        if pv1_month != "All":
+            pv1_data = pv1_data[pv1_data["Month"] == pv1_month]
+        if pv1_platforms:
+            pv1_data = pv1_data[pv1_data["Platform"].isin(pv1_platforms)]
 
-    plat_month = (pv1_data.pivot_table(index="Platform", columns="Month",
-                                  values="Sales Val", aggfunc="sum", fill_value=0)
-                     .reindex(columns=MONTH_ORDER, fill_value=0))
-    plat_month = plat_month.loc[plat_month.sum(axis=1).sort_values(ascending=False).index]
-    st.markdown(render_pivot(plat_month, ["Platform"]), unsafe_allow_html=True)
-
-    # ----- Platform × Category × Month -----
-    st.markdown(f"<h2 class='sec-title' style='margin-top:28px;'>Platform-Category Wise Sales</h2>", unsafe_allow_html=True)
-    st.markdown("<div class='sec-sub'>Sum of Sales Val by Platform → Category × Month</div>", unsafe_allow_html=True)
-
-    pv2_col1, pv2_col2 = st.columns(2)
-    with pv2_col1:
-        pv2a, pv2b = st.columns(2)
-        with pv2a:
-            pv2_year = st.selectbox("Year", available_years, index=0, key="pv2_year")
-        with pv2b:
-            pv2_months_in_year = [m for m in MONTH_ORDER
-                                  if not pivot_base[(pivot_base["Year"] == pv2_year) &
-                                                    (pivot_base["Month"] == m)].empty]
-            pv2_month_opts = ["All"] + pv2_months_in_year
-            pv2_month = st.selectbox("Month", pv2_month_opts, index=0, key="pv2_month")
-    with pv2_col2:
-        pv2_platforms = st.multiselect("Platforms", all_platforms, default=all_platforms, key="pv2_plat")
-    pv2_categories = st.multiselect("Categories", all_categories, default=all_categories, key="pv2_cat")
-
-    pv2_data = pivot_base[pivot_base["Year"] == pv2_year]
-    if pv2_month != "All":
-        pv2_data = pv2_data[pv2_data["Month"] == pv2_month]
-    if pv2_platforms:
-        pv2_data = pv2_data[pv2_data["Platform"].isin(pv2_platforms)]
-    if pv2_categories:
-        pv2_data = pv2_data[pv2_data["Category"].isin(pv2_categories)]
-
-    plat_cat_month = (pv2_data.pivot_table(index=["Platform", "Category"], columns="Month",
+        plat_month = (pv1_data.pivot_table(index="Platform", columns="Month",
                                       values="Sales Val", aggfunc="sum", fill_value=0)
                          .reindex(columns=MONTH_ORDER, fill_value=0))
-    # order platforms by total sales desc
-    plat_totals = plat_cat_month.groupby(level=0).sum().sum(axis=1).sort_values(ascending=False)
-    plat_cat_month = plat_cat_month.reindex(plat_totals.index, level=0)
-    st.markdown(render_pivot(plat_cat_month, ["Platform", "Category"]), unsafe_allow_html=True)
+        plat_month = plat_month.loc[plat_month.sum(axis=1).sort_values(ascending=False).index]
+        st.markdown(render_pivot(plat_month, ["Platform"]), unsafe_allow_html=True)
 
-    # ---------------------------------------------------------------------------
-    # Volumes view — focus SKUs
-    # ---------------------------------------------------------------------------
-    # Each bucket is either an explicit SKU list (exact ItemSubGroupDescription match)
-    # or an ItemGroupName (sums all variants, e.g. all flavours of 125ml flavoured milk).
-    VOLUME_BUCKETS: dict[str, dict] = {
-        "Whole Milk 1L":          {"sku": ["WHOLE MILK RECAP12X1000ML"]},
-        "Whole Milk 2L":          {"sku": ["WHOLE MILK 6X2000 CC (PROMO)"]},
-        "Whole Milk Pack of 4":   {"sku": ["WHOLE MILK 3X(4X1L)"]},
-        "Whole Milk 200ml":       {"sku": ["WHOLE MILK 24X200ML"]},
-        "Flavoured Milk 125ml":   {"group": "Flavoured Milk 125ml."},   # all flavours
-        "Flavoured Milk 200ml":   {"group": "Flavoured Milk 200ml."},   # closest to 250ml — no 250ml in range
-        "Tomato Paste 135g":      {"sku": ["TOMATO PASTE 48X135 GM", "Tomato Paste Organic 6x4x135gm"]},
-    }
+        # ----- Platform × Category × Month -----
+        st.markdown(f"<h2 class='sec-title' style='margin-top:28px;'>Platform-Category Wise Sales</h2>", unsafe_allow_html=True)
+        st.markdown("<div class='sec-sub'>Sum of Sales Val by Platform → Category × Month</div>", unsafe_allow_html=True)
+
+        pv2_col1, pv2_col2 = st.columns(2)
+        with pv2_col1:
+            pv2a, pv2b = st.columns(2)
+            with pv2a:
+                pv2_year = st.selectbox("Year", available_years, index=0, key="pv2_year")
+            with pv2b:
+                pv2_months_in_year = [m for m in MONTH_ORDER
+                                      if not pivot_base[(pivot_base["Year"] == pv2_year) &
+                                                        (pivot_base["Month"] == m)].empty]
+                pv2_month_opts = ["All"] + pv2_months_in_year
+                pv2_month = st.selectbox("Month", pv2_month_opts, index=0, key="pv2_month")
+        with pv2_col2:
+            pv2_platforms = st.multiselect("Platforms", all_platforms, default=all_platforms, key="pv2_plat")
+        pv2_categories = st.multiselect("Categories", all_categories, default=all_categories, key="pv2_cat")
+
+        pv2_data = pivot_base[pivot_base["Year"] == pv2_year]
+        if pv2_month != "All":
+            pv2_data = pv2_data[pv2_data["Month"] == pv2_month]
+        if pv2_platforms:
+            pv2_data = pv2_data[pv2_data["Platform"].isin(pv2_platforms)]
+        if pv2_categories:
+            pv2_data = pv2_data[pv2_data["Category"].isin(pv2_categories)]
+
+        plat_cat_month = (pv2_data.pivot_table(index=["Platform", "Category"], columns="Month",
+                                          values="Sales Val", aggfunc="sum", fill_value=0)
+                             .reindex(columns=MONTH_ORDER, fill_value=0))
+        # order platforms by total sales desc
+        plat_totals = plat_cat_month.groupby(level=0).sum().sum(axis=1).sort_values(ascending=False)
+        plat_cat_month = plat_cat_month.reindex(plat_totals.index, level=0)
+        st.markdown(render_pivot(plat_cat_month, ["Platform", "Category"]), unsafe_allow_html=True)
+
+        # ---------------------------------------------------------------------------
+        # Volumes view — focus SKUs
+        # ---------------------------------------------------------------------------
+        # Each bucket is either an explicit SKU list (exact ItemSubGroupDescription match)
+        # or an ItemGroupName (sums all variants, e.g. all flavours of 125ml flavoured milk).
+        VOLUME_BUCKETS: dict[str, dict] = {
+            "Whole Milk 1L":          {"sku": ["WHOLE MILK RECAP12X1000ML"]},
+            "Whole Milk 2L":          {"sku": ["WHOLE MILK 6X2000 CC (PROMO)"]},
+            "Whole Milk Pack of 4":   {"sku": ["WHOLE MILK 3X(4X1L)"]},
+            "Whole Milk 200ml":       {"sku": ["WHOLE MILK 24X200ML"]},
+            "Flavoured Milk 125ml":   {"group": "Flavoured Milk 125ml."},   # all flavours
+            "Flavoured Milk 200ml":   {"group": "Flavoured Milk 200ml."},   # closest to 250ml — no 250ml in range
+            "Tomato Paste 135g":      {"sku": ["TOMATO PASTE 48X135 GM", "Tomato Paste Organic 6x4x135gm"]},
+        }
 
 
-    def bucket_mask(data: pd.DataFrame, spec: dict) -> pd.Series:
-        if "sku" in spec:
-            return data["ItemSubGroupDescription"].isin(spec["sku"])
-        return data["ItemGroupName"] == spec["group"]
+        def bucket_mask(data: pd.DataFrame, spec: dict) -> pd.Series:
+            if "sku" in spec:
+                return data["ItemSubGroupDescription"].isin(spec["sku"])
+            return data["ItemGroupName"] == spec["group"]
 
 
-    st.markdown(f"<h2 class='sec-title' style='margin-top:32px;'>Volumes View — Focus SKUs</h2>", unsafe_allow_html=True)
-    st.markdown("<div class='sec-sub'>Units sold per platform per month for focus SKUs. 'Flavoured Milk' buckets sum across all flavours.</div>", unsafe_allow_html=True)
+        st.markdown(f"<h2 class='sec-title' style='margin-top:32px;'>Volumes View — Focus SKUs</h2>", unsafe_allow_html=True)
+        st.markdown("<div class='sec-sub'>Units sold per platform per month for focus SKUs. 'Flavoured Milk' buckets sum across all flavours.</div>", unsafe_allow_html=True)
 
-    # Platform selector for volumes
-    vol_platforms_avail = sorted(fdf["Platform"].dropna().unique().tolist())
-    vol_platform = st.selectbox("Platform", ["All"] + vol_platforms_avail, index=0, key="vol_plat")
-    vol_base = fdf if vol_platform == "All" else fdf[fdf["Platform"] == vol_platform]
+        # Platform selector for volumes
+        vol_platforms_avail = sorted(fdf["Platform"].dropna().unique().tolist())
+        vol_platform = st.selectbox("Platform", ["All"] + vol_platforms_avail, index=0, key="vol_plat")
+        vol_base = fdf if vol_platform == "All" else fdf[fdf["Platform"] == vol_platform]
 
-    vol_rows: list[dict] = []
-    for label, spec in VOLUME_BUCKETS.items():
-        sub = vol_base[bucket_mask(vol_base, spec)]
-        if sub.empty:
-            continue
-        monthly = sub.groupby("Month")["Sales Qty"].sum()
-        row = {"SKU": label}
-        for m in MONTH_ORDER:
-            row[m] = monthly.get(m, 0.0)
-        row["Total"] = float(monthly.sum())
-        vol_rows.append(row)
-
-    if not vol_rows:
-        st.info("No units recorded for any of the focus SKUs under the current filters.")
-    else:
-        vol_df = pd.DataFrame(vol_rows).set_index("SKU")
-        # Render as the same navy-header pivot style + a Total column
-        months_present = [m for m in MONTH_ORDER if vol_df[m].sum() > 0]
-        head = "<thead><tr><th>Focus SKU</th>" + \
-               "".join(f"<th>{m}</th>" for m in months_present) + "<th>Total</th></tr></thead>"
-        body_html = []
-        for idx, row in vol_df.iterrows():
-            cells = "".join(
-                f"<td class='num'>{fmt_cell(row[m])}</td>" for m in months_present
-            )
-            total_cell = f"<td class='num' style='background:#F3F6FB;font-weight:700;color:{NAVY_DARK}'>{human(row['Total'])}</td>"
-            body_html.append(f"<tr><td class='row-label'>{idx}</td>{cells}{total_cell}</tr>")
-        st.markdown(
-            f"<div class='pivot-wrap'><table>{head}<tbody>{''.join(body_html)}</tbody></table></div>",
-            unsafe_allow_html=True,
-        )
-
-        # Platform breakdown table — for the selected SKUs, show units by platform
-        st.markdown("<div class='sec-title' style='margin-top:18px;'>Platform breakdown</div>", unsafe_allow_html=True)
-        plat_vol_rows = []
+        vol_rows: list[dict] = []
         for label, spec in VOLUME_BUCKETS.items():
-            sub = fdf[bucket_mask(fdf, spec)]  # always full (not filtered by vol_platform)
+            sub = vol_base[bucket_mask(vol_base, spec)]
             if sub.empty:
                 continue
-            by_plat = sub.groupby("Platform")["Sales Qty"].sum().sort_values(ascending=False)
-            for plat, qty in by_plat.items():
-                if qty == 0:
-                    continue
-                plat_vol_rows.append({"Focus SKU": label, "Platform": plat, "Units": qty})
+            monthly = sub.groupby("Month")["Sales Qty"].sum()
+            row = {"SKU": label}
+            for m in MONTH_ORDER:
+                row[m] = monthly.get(m, 0.0)
+            row["Total"] = float(monthly.sum())
+            vol_rows.append(row)
 
-        if plat_vol_rows:
-            pvol_df = pd.DataFrame(plat_vol_rows)
-            # Pivot: SKU rows × Platform columns
-            pvol_pivot = pvol_df.pivot_table(index="Focus SKU", columns="Platform",
-                                             values="Units", aggfunc="sum", fill_value=0)
-            # Order platforms by total units desc
-            plat_order = pvol_pivot.sum().sort_values(ascending=False).index.tolist()
-            pvol_pivot = pvol_pivot[plat_order]
-            # Order SKUs by VOLUME_BUCKETS order
-            sku_order = [k for k in VOLUME_BUCKETS if k in pvol_pivot.index]
-            pvol_pivot = pvol_pivot.reindex(sku_order)
-
-            phead = "<thead><tr><th>Focus SKU</th>" + \
-                    "".join(f"<th>{p}</th>" for p in plat_order) + "</tr></thead>"
-            pbody = []
-            for idx, row in pvol_pivot.iterrows():
-                cells = "".join(f"<td class='num'>{fmt_cell(row[p])}</td>" for p in plat_order)
-                pbody.append(f"<tr><td class='row-label'>{idx}</td>{cells}</tr>")
+        if not vol_rows:
+            st.info("No units recorded for any of the focus SKUs under the current filters.")
+        else:
+            vol_df = pd.DataFrame(vol_rows).set_index("SKU")
+            # Render as the same navy-header pivot style + a Total column
+            months_present = [m for m in MONTH_ORDER if vol_df[m].sum() > 0]
+            head = "<thead><tr><th>Focus SKU</th>" + \
+                   "".join(f"<th>{m}</th>" for m in months_present) + "<th>Total</th></tr></thead>"
+            body_html = []
+            for idx, row in vol_df.iterrows():
+                cells = "".join(
+                    f"<td class='num'>{fmt_cell(row[m])}</td>" for m in months_present
+                )
+                total_cell = f"<td class='num' style='background:#F3F6FB;font-weight:700;color:{NAVY_DARK}'>{human(row['Total'])}</td>"
+                body_html.append(f"<tr><td class='row-label'>{idx}</td>{cells}{total_cell}</tr>")
             st.markdown(
-                f"<div class='pivot-wrap'><table>{phead}<tbody>{''.join(pbody)}</tbody></table></div>",
+                f"<div class='pivot-wrap'><table>{head}<tbody>{''.join(body_html)}</tbody></table></div>",
                 unsafe_allow_html=True,
             )
 
-        st.caption("Note: Flavoured Milk 250ml is not a current SADAFCO online-range SKU; Flavoured Milk 200ml shown as the closest match.")
+            # Platform breakdown table — for the selected SKUs, show units by platform
+            st.markdown("<div class='sec-title' style='margin-top:18px;'>Platform breakdown</div>", unsafe_allow_html=True)
+            plat_vol_rows = []
+            for label, spec in VOLUME_BUCKETS.items():
+                sub = fdf[bucket_mask(fdf, spec)]  # always full (not filtered by vol_platform)
+                if sub.empty:
+                    continue
+                by_plat = sub.groupby("Platform")["Sales Qty"].sum().sort_values(ascending=False)
+                for plat, qty in by_plat.items():
+                    if qty == 0:
+                        continue
+                    plat_vol_rows.append({"Focus SKU": label, "Platform": plat, "Units": qty})
+
+            if plat_vol_rows:
+                pvol_df = pd.DataFrame(plat_vol_rows)
+                # Pivot: SKU rows × Platform columns
+                pvol_pivot = pvol_df.pivot_table(index="Focus SKU", columns="Platform",
+                                                 values="Units", aggfunc="sum", fill_value=0)
+                # Order platforms by total units desc
+                plat_order = pvol_pivot.sum().sort_values(ascending=False).index.tolist()
+                pvol_pivot = pvol_pivot[plat_order]
+                # Order SKUs by VOLUME_BUCKETS order
+                sku_order = [k for k in VOLUME_BUCKETS if k in pvol_pivot.index]
+                pvol_pivot = pvol_pivot.reindex(sku_order)
+
+                phead = "<thead><tr><th>Focus SKU</th>" + \
+                        "".join(f"<th>{p}</th>" for p in plat_order) + "</tr></thead>"
+                pbody = []
+                for idx, row in pvol_pivot.iterrows():
+                    cells = "".join(f"<td class='num'>{fmt_cell(row[p])}</td>" for p in plat_order)
+                    pbody.append(f"<tr><td class='row-label'>{idx}</td>{cells}</tr>")
+                st.markdown(
+                    f"<div class='pivot-wrap'><table>{phead}<tbody>{''.join(pbody)}</tbody></table></div>",
+                    unsafe_allow_html=True,
+                )
+
+            st.caption("Note: Flavoured Milk 250ml is not a current SADAFCO online-range SKU; Flavoured Milk 200ml shown as the closest match.")
+
+        # ===========================================================================
+        # ---------------------------------------------------------------------------
+        # Download
+        # ---------------------------------------------------------------------------
+        def build_excel() -> bytes:
+            out = io.BytesIO()
+            with pd.ExcelWriter(out, engine="openpyxl") as xl:
+                plat_month.to_excel(xl, sheet_name="Platform x Month")
+                plat_cat_month.to_excel(xl, sheet_name="Platform-Category x Month")
+                if yoy_rows:
+                    pd.DataFrame(yoy_rows).to_excel(xl, sheet_name="YoY Comparison", index=False)
+                if vol_rows:
+                    pd.DataFrame(vol_rows).set_index("SKU").to_excel(
+                        xl, sheet_name="Focus SKU Volumes")
+                fdf[["Date", "Platform", "Category", "Brand", "SKU",
+                     "Sales Val", "Sales Qty"]].to_excel(xl, sheet_name="Filtered Data", index=False)
+            return out.getvalue()
+
+
+        st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
+        st.download_button(
+            "⬇  Download pivots as Excel",
+            data=build_excel(),
+            file_name="sadafco_online_shopping_pivots.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+        st.caption(
+            "Platforms are mapped from `CustGroup`; minor / one-off customer groups are bucketed as **Other**. "
+            "Categories are normalised from `ItemCategory` (ICE CREAM & FROZEN FOOD → Frozen, NON-DAIRY DRINKS → Drinks, etc.)."
+        )
 
 # ===========================================================================
-# PRICING DASHBOARD
+# TAB 2 — PRICING
 # ===========================================================================
-import datetime as _dt
-
-DEFAULT_DATA_DASH = "Sadafco Data Dashboard (1).xlsx"
 with tab_pricing:
-    def _parse_date_raw(v):
-        """Parse a single date value without swapping."""
-        if pd.isna(v):
-            return pd.NaT
-        if isinstance(v, str):
-            return pd.to_datetime(v, dayfirst=True, errors="coerce")
-        if isinstance(v, (_dt.datetime, pd.Timestamp)):
-            return pd.Timestamp(v)
-        return pd.NaT
-
-
-    def _fix_dates_column(series: pd.Series) -> pd.Series:
-        """Two-pass fix for mixed Excel date formats.
-        String dates (dd/mm/yyyy) are reliable. Datetime objects from Excel may have
-        month/day swapped when day<=12. We detect swapped dates by comparing against
-        the months found in string-sourced dates.
-        """
-        is_str = series.apply(lambda v: isinstance(v, str))
-        parsed = series.apply(_parse_date_raw)
-
-        str_months = set(parsed[is_str].dropna().dt.month.unique())
-        if not str_months:
-            return parsed
-
-        dt_mask = ~is_str & parsed.notna()
-        result = parsed.copy()
-        for idx in result[dt_mask].index:
-            ts = result.at[idx]
-            if ts.month not in str_months and ts.day <= 12 and ts.day in str_months:
-                try:
-                    result.at[idx] = pd.Timestamp(year=ts.year, month=ts.day, day=ts.month)
-                except Exception:
-                    pass
-        return result
-
-
-    @st.cache_data(show_spinner=False)
-    def load_pricing(path_or_buffer) -> pd.DataFrame:
-        df = pd.read_excel(path_or_buffer, sheet_name="Price")
-        df.columns = [c.strip() for c in df.columns]
-        df["Date"] = _fix_dates_column(df["Date"])
-        df["Price"] = pd.to_numeric(df["Price"], errors="coerce")
-        return df
-
-
-    @st.cache_data(show_spinner=False)
-    def load_availability(path_or_buffer) -> pd.DataFrame:
-        df = pd.read_excel(path_or_buffer, sheet_name="Availability")
-        df.columns = [c.strip() for c in df.columns]
-        df["Date"] = _fix_dates_column(df["Date"])
-        df["Availability"] = pd.to_numeric(df["Availability"], errors="coerce")
-        return df
-
-
-    # --- Load data dashboard file ---
-    with st.sidebar:
-        st.markdown("---")
-        st.markdown(f"<h3 style='color:{NAVY_DARK};margin-top:0;'>Pricing & Availability</h3>", unsafe_allow_html=True)
-        data_dash_upload = st.file_uploader("Data Dashboard file (.xlsx)", type=["xlsx"],
-                                            key="data_dash_upload")
-
-    dd_src = data_dash_upload if data_dash_upload is not None else DEFAULT_DATA_DASH
-    price_df = None
-    avail_df = None
-    try:
-        price_df = load_pricing(dd_src)
-        avail_df = load_availability(dd_src)
-    except Exception:
-        pass
-
     # ---- PRICING SECTION ----
     if price_df is not None and not price_df.empty:
-        st.markdown("<hr style='margin:40px 0 20px 0;border-color:#e5e7eb;'>", unsafe_allow_html=True)
         st.markdown(
             f"<div class='saudia-title' style='text-align:center;'>Pricing</div>"
             f"<div class='sec-sub' style='text-align:center;'>Average prices (SAR) by Brand × Platform, with daily change.</div>",
@@ -1040,182 +1236,259 @@ with tab_pricing:
             pr_date_to = st.date_input("Date to", value=pr_max_date,
                                        min_value=pr_min_date, max_value=pr_max_date, key="pr_dto")
 
-        # Apply filters
-        pf = price_df.copy()
-        if pr_f_type != "All":
-            pf = pf[pf["Type"] == pr_f_type]
-        if pr_f_plat != "All":  pf = pf[pf["Platform"] == pr_f_plat]
-        if pr_f_brand != "All": pf = pf[pf["Brand"] == pr_f_brand]
-        if pr_f_cat != "All":   pf = pf[pf["Category"] == pr_f_cat]
-        pf = pf[(pf["Date"].dt.date >= pr_date_from) & (pf["Date"].dt.date <= pr_date_to)]
+        # --- NEW: Comparison date range ---
+        pr_c7, pr_c8 = st.columns(2)
+        with pr_c7:
+            pr_comp_from = st.date_input("Compare from", value=pr_min_date, key="pr_cfrom")
+        with pr_c8:
+            pr_comp_to = st.date_input("Compare to", value=pr_max_date, key="pr_cto")
 
-        if pf.empty:
+        # Apply filters
+        # --- Main period ---
+        pf_main = price_df.copy()
+        if pr_f_plat != "All":  pf_main = pf_main[pf_main["Platform"] == pr_f_plat]
+        if pr_f_brand != "All": pf_main = pf_main[pf_main["Brand"] == pr_f_brand]
+        if pr_f_cat != "All":   pf_main = pf_main[pf_main["Category"] == pr_f_cat]
+        if pr_f_type != "All":  pf_main = pf_main[pf_main["Type"] == pr_f_type]
+        pf_main = pf_main[(pf_main["Date"].dt.date >= pr_date_from) & (pf_main["Date"].dt.date <= pr_date_to)]
+
+        # --- Comparison period ---
+        pf_comp = price_df.copy()
+        if pr_f_plat != "All":  pf_comp = pf_comp[pf_comp["Platform"] == pr_f_plat]
+        if pr_f_brand != "All": pf_comp = pf_comp[pf_comp["Brand"] == pr_f_brand]
+        if pr_f_cat != "All":   pf_comp = pf_comp[pf_comp["Category"] == pr_f_cat]
+        if pr_f_type != "All":  pf_comp = pf_comp[pf_comp["Type"] == pr_f_type]
+        pf_comp = pf_comp[(pf_comp["Date"].dt.date >= pr_comp_from) & (pf_comp["Date"].dt.date <= pr_comp_to)]
+
+
+        if pf_main.empty:
             st.info("No pricing data for the selected filters.")
         else:
-            # Compute avg price per Brand × Platform for the date range
-            # Change = avg price on latest date minus avg price on previous date
-            all_dates = sorted(pf["Date"].dropna().unique())
+            all_dates = sorted(pf_main["Date"].dropna().unique())
+            latest = all_dates[-1] if all_dates else None
+            prev = all_dates[-2] if len(all_dates) >= 2 else None
 
-            # Avg price over the full selected range
-            avg_prices = pf.pivot_table(index="Brand", columns="Platform",
-                                        values="Price", aggfunc="mean")
+            def fmt_change(v):
+                if pd.isna(v) or v == 0:
+                    return f"<span style='color:#00A651;font-weight:600'>SAR 0.00</span>"
+                color = "#E00034" if v < 0 else "#00A651"
+                return f"<span style='color:{color};font-weight:600'>SAR {v:+.2f}</span>"
 
-            # Change: latest date vs second-latest date
-            change_df = pd.DataFrame(index=avg_prices.index, columns=avg_prices.columns, dtype=float)
-            if len(all_dates) >= 2:
-                latest = all_dates[-1]
-                prev = all_dates[-2]
-                for plat in avg_prices.columns:
-                    for brand in avg_prices.index:
-                        lat_val = pf[(pf["Date"] == latest) & (pf["Platform"] == plat) &
-                                    (pf["Brand"] == brand)]["Price"].mean()
-                        prev_val = pf[(pf["Date"] == prev) & (pf["Platform"] == plat) &
-                                     (pf["Brand"] == brand)]["Price"].mean()
-                        if pd.notna(lat_val) and pd.notna(prev_val):
-                            change_df.loc[brand, plat] = lat_val - prev_val
+
+            def _price_metrics(main_df, comp_df, group_cols):
+                clean_main = main_df.dropna(subset=group_cols)
+                clean_comp = comp_df.dropna(subset=group_cols)
+
+                if clean_main.empty:
+                    return pd.DataFrame()
+
+                rows = []
+
+                grouped_main = clean_main.groupby(group_cols)
+                grouped_comp = clean_comp.groupby(group_cols)
+
+                for keys, grp_main in grouped_main:
+                    if not isinstance(keys, tuple):
+                        keys = (keys,)
+
+                    avg_main = grp_main["Price"].mean()
+
+                    # match comparison group
+                    try:
+                        grp_comp = grouped_comp.get_group(keys)
+                        avg_comp = grp_comp["Price"].mean()
+                    except KeyError:
+                        avg_comp = None
+
+                    chg = avg_main - avg_comp if avg_comp is not None else None
+
+                    row = dict(zip(group_cols, keys))
+                    row["Price"] = avg_main
+                    row["Change"] = chg
+                    rows.append(row)
+
+                return pd.DataFrame(rows).sort_values(group_cols, ignore_index=True)
+
+            def _price_cells(r):
+                p = f"{r['Price']:.2f}" if pd.notna(r["Price"]) else "—"
+                return (
+                    f"<td class='num'>{p}</td>"
+                    f"<td class='num'>{fmt_change(r['Change'])}</td>"
+                )
+
+            has_sku = "SKU" in pf_main.columns and pf_main["SKU"].notna().any()
+
+            # ----- drill-down state -----
+            if "pr_open_plats" not in st.session_state:
+                st.session_state.pr_open_plats = set()
+            if "pr_open_brands" not in st.session_state:
+                st.session_state.pr_open_brands = set()
+            if "pr_open_cats" not in st.session_state:
+                st.session_state.pr_open_cats = set()
+
+            # ----- header -----
+            st.markdown(
+                f"<div class='pivot-wrap' style='margin-bottom:0'><table><thead><tr>"
+                f"<th style='min-width:240px;text-align:left'>Name</th>"
+                f"<th>Price (SAR)</th><th>Change</th>"
+                f"</tr></thead></table></div>",
+                unsafe_allow_html=True,
+            )
+
+            # ===== LEVEL 1: Platforms =====
+            plat_tbl = _price_metrics(pf_main, pf_comp, ["Platform"])
+
+            for _, pr_row in plat_tbl.iterrows():
+                plat = pr_row["Platform"]
+                plat_open = plat in st.session_state.pr_open_plats
+                icon = "▼" if plat_open else "▶"
+
+                c1, c2 = st.columns([0.04, 0.96])
+                with c1:
+                    if st.button(icon, key=f"prp_{plat}"):
+                        if plat_open:
+                            st.session_state.pr_open_plats.discard(plat)
+                            st.session_state.pr_open_brands = {
+                                k for k in st.session_state.pr_open_brands
+                                if not k.startswith(f"{plat}||")
+                            }
+                            st.session_state.pr_open_cats = {
+                                k for k in st.session_state.pr_open_cats
+                                if not k.startswith(f"{plat}||")
+                            }
                         else:
-                            change_df.loc[brand, plat] = 0.0
-
-            # Also compute Total (average across platforms)
-            avg_prices["Total"] = avg_prices.mean(axis=1)
-            if not change_df.empty:
-                change_df["Total"] = change_df.mean(axis=1)
-
-                # Render pricing table — unified, Brand (always shown) + optional Category expansion
-                plats = [c for c in avg_prices.columns if c != "Total"]
-
-                # Build Brand × Category level data
-                brand_cat_avg = pf.pivot_table(
-                    index=["Brand", "Category"], columns="Platform",
-                    values="Price", aggfunc="mean"
-                )
-                brand_cat_avg["Total"] = brand_cat_avg.mean(axis=1)
-
-                # Change at Brand × Category level
-                brand_cat_chg = pd.DataFrame(
-                    index=brand_cat_avg.index, columns=brand_cat_avg.columns, dtype=float
-                ).fillna(0.0)
-                if len(all_dates) >= 2:
-                    latest = all_dates[-1]
-                    prev = all_dates[-2]
-                    for (brand, cat) in brand_cat_avg.index:
-                        for plat in list(plats) + ["Total"]:
-                            if plat == "Total":
-                                lat_v = pf[(pf["Date"] == latest) & (pf["Brand"] == brand) & (pf["Category"] == cat)][
-                                    "Price"].mean()
-                                prev_v = pf[(pf["Date"] == prev) & (pf["Brand"] == brand) & (pf["Category"] == cat)][
-                                    "Price"].mean()
-                            else:
-                                lat_v = pf[(pf["Date"] == latest) & (pf["Platform"] == plat) & (pf["Brand"] == brand) & (
-                                            pf["Category"] == cat)]["Price"].mean()
-                                prev_v = pf[(pf["Date"] == prev) & (pf["Platform"] == plat) & (pf["Brand"] == brand) & (
-                                            pf["Category"] == cat)]["Price"].mean()
-                            if pd.notna(lat_v) and pd.notna(prev_v):
-                                brand_cat_chg.loc[(brand, cat), plat] = lat_v - prev_v
-
-
-                def fmt_change(v):
-                    if pd.isna(v) or v == 0:
-                        return "<span style='color:#6B7280;font-weight:500'>—</span>"
-                    color = "#E00034" if v < 0 else "#00A651"
-                    return f"<span style='color:{color};font-weight:600'>SAR {v:+.2f}</span>"
-
-
-                def fmt_price(v):
-                    return f"{v:.2f}" if pd.notna(v) else "—"
-
-
-                brands_in_order = avg_prices.index.tolist()
-
-                # Compact multiselect to choose which brands show category breakdown
-                expanded_brands = st.multiselect(
-                    "Expand category breakdown for:",
-                    options=brands_in_order,
-                    default=[],
-                    key="pr_expand_brands_ms",
-                    placeholder="Select brands to see category detail…",
-                )
-                expanded_set = set(expanded_brands)
-
-                # Single unified table
-                pr_head = (
-                    f"<thead>"
-                    f"<tr>"
-                    f"<th rowspan='2' style='text-align:left;min-width:200px;'>Brand / Category</th>"
-                )
-                for p in plats:
-                    pr_head += f"<th colspan='2' style='text-align:center;'>{p}</th>"
-                pr_head += "<th colspan='2' style='text-align:center;'>Total</th></tr><tr>"
-                for _ in plats + ["Total"]:
-                    pr_head += "<th>Price</th><th>Change</th>"
-                pr_head += "</tr></thead>"
-
-                pr_body = []
-                for brand in brands_in_order:
-                    is_expanded = brand in expanded_set
-
-                    # Brand row
-                    brand_cells = ""
-                    for p in plats + ["Total"]:
-                        pv = avg_prices.loc[brand, p] if p in avg_prices.columns else float("nan")
-                        cv = change_df.loc[brand, p] if (not change_df.empty and p in change_df.columns) else 0.0
-                        brand_cells += f"<td class='num'>{fmt_price(pv)}</td>"
-                        brand_cells += f"<td class='num'>{fmt_change(cv)}</td>"
-
-                    indicator = "▾" if is_expanded else "▸"
-                    pr_body.append(
-                        f"<tr style='background:#e8eef7;border-top:2px solid #c5d0e6;'>"
-                        f"<td style='font-weight:700;color:{NAVY_DARK};padding:10px 12px;font-size:13.5px;'>"
-                        f"{indicator} {brand}</td>"
-                        f"{brand_cells}</tr>"
+                            st.session_state.pr_open_plats.add(plat)
+                        st.rerun()
+                with c2:
+                    st.markdown(
+                        f"<div class='pivot-wrap' style='margin:0'><table><tr>"
+                        f"<td class='row-label' style='font-weight:700;min-width:230px'>{plat}</td>"
+                        f"{_price_cells(pr_row)}</tr></table></div>",
+                        unsafe_allow_html=True,
                     )
 
-                    # Category child rows
-                    if is_expanded and brand in brand_cat_avg.index.get_level_values(0):
-                        cats_for_brand = brand_cat_avg.loc[brand].index.tolist()
-                        for i, cat in enumerate(cats_for_brand):
-                            cat_cells = ""
-                            for p in plats + ["Total"]:
-                                try:
-                                    pv = brand_cat_avg.loc[(brand, cat), p]
-                                except KeyError:
-                                    pv = float("nan")
-                                try:
-                                    cv = brand_cat_chg.loc[(brand, cat), p]
-                                except KeyError:
-                                    cv = 0.0
-                                cat_cells += f"<td class='num'>{fmt_price(pv)}</td>"
-                                cat_cells += f"<td class='num'>{fmt_change(cv)}</td>"
-                            row_bg = "#fafbfd" if i % 2 == 0 else "#f3f6fb"
-                            pr_body.append(
-                                f"<tr style='background:{row_bg};'>"
-                                f"<td style='padding:7px 12px 7px 32px;color:#374151;font-size:12.5px;border-left:3px solid {SAUDIA_BLUE};'>"
-                                f"<span style='color:{SAUDIA_BLUE};margin-right:6px;'>▸</span>{cat}</td>"
-                                f"{cat_cells}</tr>"
+                if not plat_open:
+                    continue
+
+                # ===== LEVEL 2: Brands under this platform =====
+                plat_data = pf_main[pf_main["Platform"] == plat]
+                brand_tbl = _price_metrics(
+                    pf_main[pf_main["Platform"] == plat],
+                    pf_comp[pf_comp["Platform"] == plat],
+                    ["Brand"]
+                )
+
+                for _, br_row in brand_tbl.iterrows():
+                    brand = br_row["Brand"]
+                    brand_key = f"{plat}||{brand}"
+                    brand_open = brand_key in st.session_state.pr_open_brands
+                    icon2 = "▼" if brand_open else "▶"
+
+                    c_sp, c_btn, c_tbl = st.columns([0.03, 0.04, 0.93])
+                    with c_btn:
+                        if st.button(icon2, key=f"prb_{brand_key}"):
+                            if brand_open:
+                                st.session_state.pr_open_brands.discard(brand_key)
+                                st.session_state.pr_open_cats = {
+                                    k for k in st.session_state.pr_open_cats
+                                    if not k.startswith(f"{brand_key}||")
+                                }
+                            else:
+                                st.session_state.pr_open_brands.add(brand_key)
+                            st.rerun()
+                    with c_tbl:
+                        st.markdown(
+                            f"<div class='pivot-wrap' style='margin:0'><table><tr>"
+                            f"<td class='row-label' style='padding-left:16px;min-width:214px'>{brand}</td>"
+                            f"{_price_cells(br_row)}</tr></table></div>",
+                            unsafe_allow_html=True,
+                        )
+
+                    if not brand_open:
+                        continue
+
+                    # ===== LEVEL 3: Categories under this brand =====
+                    brand_data = plat_data[plat_data["Brand"] == brand]
+                    cat_tbl = _price_metrics(
+                        pf_main[(pf_main["Platform"] == plat) & (pf_main["Brand"] == brand)],
+                        pf_comp[(pf_comp["Platform"] == plat) & (pf_comp["Brand"] == brand)],
+                        ["Category"]
+                    )
+
+                    for _, ct_row in cat_tbl.iterrows():
+                        cat = ct_row["Category"]
+                        cat_key = f"{brand_key}||{cat}"
+                        cat_open = cat_key in st.session_state.pr_open_cats
+                        icon3 = "▼" if cat_open else "▶"
+
+                        s_sp, s_sp2, s_btn, s_tbl = st.columns([0.03, 0.03, 0.04, 0.90])
+                        with s_btn:
+                            if has_sku and st.button(icon3, key=f"prc_{hash(cat_key) % 10**8}"):
+                                if cat_open:
+                                    st.session_state.pr_open_cats.discard(cat_key)
+                                else:
+                                    st.session_state.pr_open_cats.add(cat_key)
+                                st.rerun()
+                        with s_tbl:
+                            st.markdown(
+                                f"<div class='pivot-wrap' style='margin:0'><table><tr>"
+                                f"<td class='row-label' style='padding-left:8px;min-width:198px;font-size:12px'>"
+                                f"{cat}</td>"
+                                f"{_price_cells(ct_row)}</tr></table></div>",
+                                unsafe_allow_html=True,
                             )
 
-                # Total row
-                total_cells = ""
-                for p in plats + ["Total"]:
-                    pv = avg_prices[p].mean() if p in avg_prices.columns else 0
-                    cv = change_df[p].mean() if (not change_df.empty and p in change_df.columns) else 0
-                    total_cells += f"<td class='num' style='font-weight:700'>{pv:.2f}</td>"
-                    total_cells += f"<td class='num'>{fmt_change(cv)}</td>"
-                pr_body.append(
-                    f"<tr style='border-top:3px solid {NAVY};background:#f0f4fa;'>"
-                    f"<td style='font-weight:700;color:{NAVY_DARK};padding:10px 12px;'>Total</td>"
-                    f"{total_cells}</tr>"
-                )
+                        if not cat_open or not has_sku:
+                            continue
 
+                        # ===== LEVEL 4: SKUs under this category =====
+                        cat_data = brand_data[brand_data["Category"] == cat]
+                        sku_tbl = _price_metrics(
+                            pf_main[(pf_main["Platform"] == plat) & (pf_main["Brand"] == brand) & (
+                                        pf_main["Category"] == cat)],
+                            pf_comp[(pf_comp["Platform"] == plat) & (pf_comp["Brand"] == brand) & (
+                                        pf_comp["Category"] == cat)],
+                            ["SKU"]
+                        )
+
+                        for _, sk_row in sku_tbl.iterrows():
+                            sku_label = str(sk_row["SKU"])
+                            if " PC: Z" in sku_label:
+                                sku_label = sku_label.split(" PC: Z")[0]
+                            st.markdown(
+                                f"<div class='pivot-wrap' style='margin:0 0 0 90px'><table><tr>"
+                                f"<td class='num' style='min-width:180px;color:{MUTED};font-size:12px'>"
+                                f"{sku_label}</td>"
+                                f"{_price_cells(sk_row)}</tr></table></div>",
+                                unsafe_allow_html=True,
+                            )
+
+            # ----- Total row -----
+            if not plat_tbl.empty:
+                tp = plat_tbl["Price"].mean()
+                tc = plat_tbl["Change"].mean()
                 st.markdown(
-                    f"<div class='pivot-wrap'><table>{pr_head}<tbody>{''.join(pr_body)}</tbody></table></div>",
+                    f"<div class='pivot-wrap' style='margin-top:2px'><table>"
+                    f"<tr style='border-top:2px solid {NAVY}'>"
+                    f"<td class='row-label' style='font-weight:700;min-width:240px'>Total</td>"
+                    f"<td class='num' style='font-weight:700'>{tp:.2f}</td>"
+                    f"<td class='num'>{fmt_change(tc)}</td>"
+                    f"</tr></table></div>",
                     unsafe_allow_html=True,
                 )
+    else:
+        if _dd_load_error:
+            st.error(f"Failed to load pricing data: {_dd_load_error}")
+        else:
+            st.info("No pricing data available. Upload the Data Dashboard file (.xlsx) via the sidebar.")
 
-# ---- AVAILABILITY SECTION ----
+
+# ===========================================================================
+# TAB 3 — AVAILABILITY
+# ===========================================================================
 with tab_availability:
+    # ---- AVAILABILITY SECTION ----
     if avail_df is not None and not avail_df.empty:
-        st.markdown("<hr style='margin:40px 0 20px 0;border-color:#e5e7eb;'>", unsafe_allow_html=True)
         st.markdown(
             f"<div class='saudia-title' style='text-align:center;'>Availability</div>"
             f"<div class='sec-sub' style='text-align:center;'>SKU availability % by Brand × Platform, with period comparison.</div>",
@@ -1236,15 +1509,6 @@ with tab_availability:
         with av_c4:
             av_brands = ["All"] + sorted(avail_df["Brand"].dropna().unique().tolist())
             av_f_brand = st.selectbox("Brand", av_brands, index=0, key="av_brand")
-        # with av_c5:
-        #     av_min_date = avail_df["Date"].min().date() if avail_df["Date"].notna().any() else date.today()
-        #     av_max_date = avail_df["Date"].max().date() if avail_df["Date"].notna().any() else date.today()
-        #     av_date_from = st.date_input("Date from", value=av_min_date,
-        #                                  min_value=av_min_date, max_value=av_max_date, key="av_dfrom")
-        # with av_c6:
-        #     av_date_to = st.date_input("Date to", value=av_max_date,
-        #                                min_value=av_min_date, max_value=av_max_date, key="av_dto")
-
         with av_c5:
             av_min_date = avail_df["Date"].min().date() if avail_df["Date"].notna().any() else date.today()
             av_max_date = avail_df["Date"].max().date() if avail_df["Date"].notna().any() else date.today()
@@ -1254,23 +1518,6 @@ with tab_availability:
             av_date_to = st.date_input("Date to", value=av_max_date,
                                        min_value=av_min_date, max_value=av_max_date, key="av_dto")
 
-        # Compare To date range — explicit, separate from the auto prior-period logic
-        av_cmp_c1, av_cmp_c2, av_cmp_c3 = st.columns([2, 1, 1])
-        with av_cmp_c1:
-            st.markdown(
-                f"<div style='padding-top:28px;font-size:13px;font-weight:600;color:{NAVY_DARK};'>"
-                f"Compare to period:</div>",
-                unsafe_allow_html=True,
-            )
-        with av_cmp_c2:
-            range_days = (av_date_to - av_date_from).days
-            default_comp_from = max(av_date_from - timedelta(days=range_days + 1), av_min_date)
-            default_comp_to = max(av_date_from - timedelta(days=1), av_min_date)
-            av_comp_from = st.date_input("Compare from", value=default_comp_from,
-                                         min_value=av_min_date, max_value=av_max_date, key="av_cmp_from")
-        with av_cmp_c3:
-            av_comp_to = st.date_input("Compare to", value=default_comp_to,
-                                       min_value=av_min_date, max_value=av_max_date, key="av_cmp_to")
         # Apply filters
         af = avail_df.copy()
         if av_f_plat != "All":  af = af[af["Platform"] == av_f_plat]
@@ -1292,41 +1539,7 @@ with tab_availability:
                 unsafe_allow_html=True,
             )
 
-            # Availability by Brand
-            brand_avail = (af.groupby("Brand")["Availability"].mean() * 100).round(1)
-
-            # Compute vs comparison period (same length window before the selected range)
-            # Use the explicitly chosen comparison period
-            comp_from = av_comp_from
-            comp_to = av_comp_to
-            af_comp = avail_df.copy()
-
-            if av_f_plat != "All":  af_comp = af_comp[af_comp["Platform"] == av_f_plat]
-            if av_f_store != "All": af_comp = af_comp[af_comp["Store"] == av_f_store]
-            if av_f_cat != "All":   af_comp = af_comp[af_comp["Category"] == av_f_cat]
-            if av_f_brand != "All": af_comp = af_comp[af_comp["Brand"] == av_f_brand]
-            af_comp = af_comp[(af_comp["Date"].dt.date >= comp_from) & (af_comp["Date"].dt.date <= comp_to)]
-            comp_brand = (af_comp.groupby("Brand")["Availability"].mean() * 100).round(1) if not af_comp.empty else pd.Series(dtype=float)
-
-            # MTD & YTD
-            today = av_date_to
-            mtd_start = today.replace(day=1)
-            ytd_start = today.replace(month=1, day=1)
-            af_full = avail_df.copy()
-            if av_f_plat != "All":  af_full = af_full[af_full["Platform"] == av_f_plat]
-            if av_f_store != "All": af_full = af_full[af_full["Store"] == av_f_store]
-            if av_f_cat != "All":   af_full = af_full[af_full["Category"] == av_f_cat]
-            if av_f_brand != "All": af_full = af_full[af_full["Brand"] == av_f_brand]
-
-            af_mtd = af_full[(af_full["Date"].dt.date >= mtd_start) & (af_full["Date"].dt.date <= today)]
-            af_ytd = af_full[(af_full["Date"].dt.date >= ytd_start) & (af_full["Date"].dt.date <= today)]
-            mtd_brand = (af_mtd.groupby("Brand")["Availability"].mean() * 100).round(1) if not af_mtd.empty else pd.Series(dtype=float)
-            ytd_brand = (af_ytd.groupby("Brand")["Availability"].mean() * 100).round(1) if not af_ytd.empty else pd.Series(dtype=float)
-
-            # Build table
-            av_head = ("<thead><tr><th>Brand</th><th>Availability</th>"
-                       "<th>vs Chosen Period</th><th>MTD</th><th>YTD</th></tr></thead>")
-
+            # ----- helpers -----
             def fmt_avail_pct(v):
                 if pd.isna(v):
                     return "<span style='color:#9ca3af'>—</span>"
@@ -1343,41 +1556,232 @@ with tab_availability:
                     return f"<span style='color:#E00034;font-weight:600'>▼ {diff:+.0f}%</span>"
                 return f"<span style='color:{MUTED}'>0%</span>"
 
-            av_body = []
-            for brand in brand_avail.index:
-                avail_val = brand_avail.get(brand, float("nan"))
-                comp_val = comp_brand.get(brand, float("nan"))
-                mtd_val = mtd_brand.get(brand, float("nan"))
-                ytd_val = ytd_brand.get(brand, float("nan"))
-                av_body.append(
-                    f"<tr><td class='row-label'>{brand}</td>"
-                    f"<td class='num'>{fmt_avail_pct(avail_val)}</td>"
-                    f"<td class='num'>{fmt_vs_period(avail_val, comp_val)}</td>"
-                    f"<td class='num'>{fmt_avail_pct(mtd_val)}</td>"
-                    f"<td class='num'>{fmt_avail_pct(ytd_val)}</td></tr>"
+            def _avail_metrics(data, data_full, group_cols):
+                if data.empty:
+                    return pd.DataFrame()
+                clean = data.dropna(subset=group_cols)
+                if clean.empty:
+                    return pd.DataFrame()
+                grouped = (clean.groupby(group_cols)["Availability"]
+                           .mean() * 100).round(1).reset_index()
+                grouped.columns = list(group_cols) + ["Availability"]
+                range_days = (av_date_to - av_date_from).days + 1
+                comp_from = av_date_from - timedelta(days=range_days)
+                comp_to = av_date_from - timedelta(days=1)
+                af_c = data_full[(data_full["Date"].dt.date >= comp_from) &
+                                 (data_full["Date"].dt.date <= comp_to)]
+                if not af_c.empty:
+                    clean_c = af_c.dropna(subset=group_cols)
+                    if not clean_c.empty:
+                        comp = (clean_c.groupby(group_cols)["Availability"]
+                                .mean() * 100).round(1).reset_index()
+                        comp.columns = list(group_cols) + ["Availability_comp"]
+                        grouped = grouped.merge(comp, on=group_cols, how="left")
+                    else:
+                        grouped["Availability_comp"] = float("nan")
+                else:
+                    grouped["Availability_comp"] = float("nan")
+                today = av_date_to
+                for label, s_date in [("MTD", today.replace(day=1)),
+                                      ("YTD", today.replace(month=1, day=1))]:
+                    src = data_full[(data_full["Date"].dt.date >= s_date) &
+                                    (data_full["Date"].dt.date <= today)]
+                    if not src.empty:
+                        clean_s = src.dropna(subset=group_cols)
+                        if not clean_s.empty:
+                            m = (clean_s.groupby(group_cols)["Availability"]
+                                 .mean() * 100).round(1).reset_index()
+                            m.columns = list(group_cols) + [label]
+                            grouped = grouped.merge(m, on=group_cols, how="left")
+                        else:
+                            grouped[label] = float("nan")
+                    else:
+                        grouped[label] = float("nan")
+                return grouped.sort_values("Availability", ignore_index=True)
+
+            def _metric_cells(r):
+                return (
+                    f"<td class='num'>{fmt_avail_pct(r['Availability'])}</td>"
+                    f"<td class='num'>{fmt_vs_period(r['Availability'], r.get('Availability_comp', float('nan')))}</td>"
+                    f"<td class='num'>{fmt_avail_pct(r.get('MTD', float('nan')))}</td>"
+                    f"<td class='num'>{fmt_avail_pct(r.get('YTD', float('nan')))}</td>"
                 )
 
-            # Total row
-            total_avail = brand_avail.mean()
-            total_comp = comp_brand.mean() if not comp_brand.empty else float("nan")
-            total_mtd = mtd_brand.mean() if not mtd_brand.empty else float("nan")
-            total_ytd = ytd_brand.mean() if not ytd_brand.empty else float("nan")
-            av_body.append(
-                f"<tr style='border-top:2px solid {NAVY}'>"
-                f"<td class='row-label' style='font-weight:700'>Total</td>"
-                f"<td class='num'>{fmt_avail_pct(total_avail)}</td>"
-                f"<td class='num'>{fmt_vs_period(total_avail, total_comp)}</td>"
-                f"<td class='num'>{fmt_avail_pct(total_mtd)}</td>"
-                f"<td class='num'>{fmt_avail_pct(total_ytd)}</td></tr>"
-            )
+            def _clean_sku(s):
+                s = str(s)
+                if " PC: Z" in s:
+                    return s.split(" PC: Z")[0]
+                return s
 
-            st.markdown(
-                f"<div class='pivot-wrap'><table>{av_head}<tbody>{''.join(av_body)}</tbody></table></div>",
-                unsafe_allow_html=True,
-            )
+            def _clean_store(s):
+                return str(s).replace("_", " ").title()
 
-            # Availability by Platform
-            st.markdown("<div class='sec-title' style='margin-top:18px;'>Availability by Platform</div>", unsafe_allow_html=True)
+            # ----- filtered full dataset -----
+            af_full = avail_df.copy()
+            if av_f_plat != "All":  af_full = af_full[af_full["Platform"] == av_f_plat]
+            if "Store" in af_full.columns and av_f_store != "All":
+                af_full = af_full[af_full["Store"] == av_f_store]
+            if av_f_cat != "All":   af_full = af_full[af_full["Category"] == av_f_cat]
+            if av_f_brand != "All": af_full = af_full[af_full["Brand"] == av_f_brand]
+
+            has_store = "Store" in af.columns and af["Store"].notna().any()
+            has_sku = "SKU" in af.columns and af["SKU"].notna().any()
+
+            # ----- drill-down state -----
+            if "av_open_plats" not in st.session_state:
+                st.session_state.av_open_plats = set()
+            if "av_open_cats" not in st.session_state:
+                st.session_state.av_open_cats = set()
+            if "av_open_skus" not in st.session_state:
+                st.session_state.av_open_skus = set()
+
+            # ----- header row (always visible) -----
+            hdr_html = (
+                f"<div class='pivot-wrap' style='margin-bottom:0'><table><thead><tr>"
+                f"<th style='min-width:240px;text-align:left'>Name</th>"
+                f"<th>Availability</th><th>vs Period</th><th>MTD</th><th>YTD</th>"
+                f"</tr></thead></table></div>"
+            )
+            st.markdown(hdr_html, unsafe_allow_html=True)
+
+            # ===== LEVEL 1: Platforms =====
+            plat_table = _avail_metrics(af, af_full, ["Platform"])
+
+            for _, pr in plat_table.iterrows():
+                plat = pr["Platform"]
+                plat_open = plat in st.session_state.av_open_plats
+                icon = "▼" if plat_open else "▶"
+
+                # Platform row
+                c1, c2 = st.columns([0.04, 0.96])
+                with c1:
+                    if st.button(icon, key=f"avp_{plat}"):
+                        if plat_open:
+                            st.session_state.av_open_plats.discard(plat)
+                            # close children too
+                            st.session_state.av_open_cats = {
+                                k for k in st.session_state.av_open_cats
+                                if not k.startswith(f"{plat}||")
+                            }
+                            st.session_state.av_open_skus = {
+                                k for k in st.session_state.av_open_skus
+                                if not k.startswith(f"{plat}||")
+                            }
+                        else:
+                            st.session_state.av_open_plats.add(plat)
+                        st.rerun()
+                with c2:
+                    st.markdown(
+                        f"<div class='pivot-wrap' style='margin:0'><table><tr>"
+                        f"<td class='row-label' style='font-weight:700;min-width:230px'>{plat}</td>"
+                        f"{_metric_cells(pr)}</tr></table></div>",
+                        unsafe_allow_html=True,
+                    )
+
+                if not plat_open:
+                    continue
+
+                # ===== LEVEL 2: Categories under this platform =====
+                plat_data = af[af["Platform"] == plat]
+                plat_full = af_full[af_full["Platform"] == plat]
+                cat_table = _avail_metrics(plat_data, plat_full, ["Category"])
+
+                for _, cr in cat_table.iterrows():
+                    cat = cr["Category"]
+                    cat_key = f"{plat}||{cat}"
+                    cat_open = cat_key in st.session_state.av_open_cats
+                    icon2 = "▼" if cat_open else "▶"
+
+                    c_sp, c_btn, c_tbl = st.columns([0.03, 0.04, 0.93])
+                    with c_btn:
+                        if has_sku and st.button(icon2, key=f"avc_{cat_key}"):
+                            if cat_open:
+                                st.session_state.av_open_cats.discard(cat_key)
+                                st.session_state.av_open_skus = {
+                                    k for k in st.session_state.av_open_skus
+                                    if not k.startswith(f"{cat_key}||")
+                                }
+                            else:
+                                st.session_state.av_open_cats.add(cat_key)
+                            st.rerun()
+                    with c_tbl:
+                        st.markdown(
+                            f"<div class='pivot-wrap' style='margin:0'><table><tr>"
+                            f"<td class='row-label' style='padding-left:16px;min-width:214px'>{cat}</td>"
+                            f"{_metric_cells(cr)}</tr></table></div>",
+                            unsafe_allow_html=True,
+                        )
+
+                    if not cat_open or not has_sku:
+                        continue
+
+                    # ===== LEVEL 3: SKUs under this category =====
+                    cat_data = plat_data[plat_data["Category"] == cat]
+                    cat_full = plat_full[plat_full["Category"] == cat]
+                    sku_table = _avail_metrics(cat_data, cat_full, ["SKU"])
+
+                    for _, sr in sku_table.iterrows():
+                        sku_raw = sr["SKU"]
+                        sku_label = _clean_sku(sku_raw)
+                        sku_key = f"{cat_key}||{sku_raw}"
+                        sku_open = sku_key in st.session_state.av_open_skus
+                        icon3 = "▼" if sku_open else "▶"
+
+                        s_sp, s_sp2, s_btn, s_tbl = st.columns([0.03, 0.03, 0.04, 0.90])
+                        with s_btn:
+                            if has_store and st.button(icon3, key=f"avs_{hash(sku_key) % 10**8}"):
+                                if sku_open:
+                                    st.session_state.av_open_skus.discard(sku_key)
+                                else:
+                                    st.session_state.av_open_skus.add(sku_key)
+                                st.rerun()
+                        with s_tbl:
+                            st.markdown(
+                                f"<div class='pivot-wrap' style='margin:0'><table><tr>"
+                                f"<td class='row-label' style='padding-left:8px;min-width:198px;font-size:12px'>"
+                                f"{sku_label}</td>"
+                                f"{_metric_cells(sr)}</tr></table></div>",
+                                unsafe_allow_html=True,
+                            )
+
+                        if not sku_open or not has_store:
+                            continue
+
+                        # ===== LEVEL 4: Dark Stores under this SKU =====
+                        sku_data = cat_data[cat_data["SKU"] == sku_raw]
+                        sku_full = cat_full[cat_full["SKU"] == sku_raw]
+                        store_table = _avail_metrics(sku_data, sku_full, ["Store"])
+
+                        for _, dr in store_table.iterrows():
+                            st.markdown(
+                                f"<div class='pivot-wrap' style='margin:0 0 0 90px'><table><tr>"
+                                f"<td class='num' style='min-width:180px;color:{MUTED};font-size:12px'>"
+                                f"{_clean_store(dr['Store'])}</td>"
+                                f"{_metric_cells(dr)}</tr></table></div>",
+                                unsafe_allow_html=True,
+                            )
+
+            # ----- Total row -----
+            if not plat_table.empty:
+                ta = plat_table["Availability"].mean()
+                tc = plat_table["Availability_comp"].mean()
+                tm = plat_table["MTD"].mean()
+                ty = plat_table["YTD"].mean()
+                st.markdown(
+                    f"<div class='pivot-wrap' style='margin-top:2px'><table>"
+                    f"<tr style='border-top:2px solid {NAVY}'>"
+                    f"<td class='row-label' style='font-weight:700;min-width:240px'>Total</td>"
+                    f"<td class='num'>{fmt_avail_pct(ta)}</td>"
+                    f"<td class='num'>{fmt_vs_period(ta, tc)}</td>"
+                    f"<td class='num'>{fmt_avail_pct(tm)}</td>"
+                    f"<td class='num'>{fmt_avail_pct(ty)}</td>"
+                    f"</tr></table></div>",
+                    unsafe_allow_html=True,
+                )
+
+            # ===== PLATFORM BAR CHART =====
+            st.markdown("<div class='sec-title' style='margin-top:24px;'>Availability by Platform</div>",
+                        unsafe_allow_html=True)
             plat_avail = (af.groupby("Platform")["Availability"].mean() * 100).round(1)
             if not plat_avail.empty:
                 fig = go.Figure(go.Bar(
@@ -1393,34 +1797,8 @@ with tab_availability:
                     xaxis=dict(title=""),
                 )
                 st.plotly_chart(fig, use_container_width=True)
-
-    # ---------------------------------------------------------------------------
-    # Download
-    # ---------------------------------------------------------------------------
-    def build_excel() -> bytes:
-        out = io.BytesIO()
-        with pd.ExcelWriter(out, engine="openpyxl") as xl:
-            plat_month.to_excel(xl, sheet_name="Platform x Month")
-            plat_cat_month.to_excel(xl, sheet_name="Platform-Category x Month")
-            if yoy_rows:
-                pd.DataFrame(yoy_rows).to_excel(xl, sheet_name="YoY Comparison", index=False)
-            if vol_rows:
-                pd.DataFrame(vol_rows).set_index("SKU").to_excel(
-                    xl, sheet_name="Focus SKU Volumes")
-            fdf[["Date", "Platform", "Category", "Brand", "SKU",
-                 "Sales Val", "Sales Qty"]].to_excel(xl, sheet_name="Filtered Data", index=False)
-        return out.getvalue()
-
-
-    st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
-    st.download_button(
-        "⬇  Download pivots as Excel",
-        data=build_excel(),
-        file_name="sadafco_online_shopping_pivots.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-
-    st.caption(
-        "Platforms are mapped from `CustGroup`; minor / one-off customer groups are bucketed as **Other**. "
-        "Categories are normalised from `ItemCategory` (ICE CREAM & FROZEN FOOD → Frozen, NON-DAIRY DRINKS → Drinks, etc.)."
-    )
+    else:
+        if _dd_load_error:
+            st.error(f"Failed to load availability data: {_dd_load_error}")
+        else:
+            st.info("No availability data available. Upload the Data Dashboard file (.xlsx) via the sidebar.")
