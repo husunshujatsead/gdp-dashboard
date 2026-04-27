@@ -5,3 +5,5 @@ openpyxl>=3.1.2
 matplotlib>=3.10.8
 numpy
 datetime
+xlsxwriter
+python-calamine
