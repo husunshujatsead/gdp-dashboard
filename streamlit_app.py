@@ -200,6 +200,40 @@ MONTH_ORDER = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
 MONTH_NUM_TO_ABR = {i + 1: m for i, m in enumerate(MONTH_ORDER)}
 MONTH_ABR_TO_NUM = {m: i + 1 for i, m in enumerate(MONTH_ORDER)}
 
+# ---------------------------------------------------------------------------
+# Subcategory remap (defined early so cached loaders can use it)
+# ---------------------------------------------------------------------------
+subcategory_to_main = {
+    "Paste": "Culinary",
+    "MAYONNAISE": "Culinary",
+    "Milk": "Dairy",
+    "Ice Cream": "Frozen",
+    "Ice Cream Stick": "Frozen",
+    "Cone": "Frozen",
+    "Frozen Yogurt / Frozen": "Frozen",
+    "Sandwich": "Snacks",
+    "Letters": "Snacks",
+    "Chips": "Snacks",
+    "Cheese Balls": "Snacks",
+    "Rings": "Snacks",
+    "Dip": "Culinary",
+    "Hot Sauce": "Culinary",
+    "Sauce": "Culinary",
+    "Honey": "Culinary",
+    "Ketchup": "Culinary",
+    "Cream": "Dairy",
+    "Drinks": "Snacks",
+    "Milk Powder": "Dairy",
+    "French Fries / Frozen": "Frozen",
+    "Stick": "Snacks",
+    "Ice Cream Chocolate / Frozen": "Frozen",
+    "Coffee": "Snacks",
+    "Yoghurt": "Dairy",
+    "Evaporated Milk": "Dairy",
+    "Snacks": "Snacks",
+    "Other": "Other",
+}
+
 _PLATFORM_KW: list[tuple] = [
     (_re.compile(r"hunger\s*sta", _re.I),             "Hungerstation"),
     (_re.compile(r"ninja", _re.I),                    "Ninja"),
@@ -227,6 +261,18 @@ def _to_categorical(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
         if c in df.columns and df[c].dtype != "category":
             df[c] = df[c].astype("category")
     return df
+
+
+def _apply_category_remap(d: pd.DataFrame) -> pd.DataFrame:
+    """Remap raw sub-categories → top-level categories. Pure function so it
+    can be safely called inside cached builders."""
+    if d is None or d.empty or "Category" not in d.columns:
+        return d
+    d = d.copy()
+    raw = d["Category"].astype("string")
+    mapped = raw.map(subcategory_to_main)
+    d["Category"] = mapped.fillna(raw).astype("category")
+    return d
 
 
 def _path_cache_key(path_or_buffer):
@@ -275,11 +321,11 @@ def _fix_dates_column(series: pd.Series) -> pd.Series:
 
 
 # ---------------------------------------------------------------------------
-# CACHED LOADERS
+# CACHED LOADERS  (calamine engine throughout for ~5-10x faster Excel reads)
 # ---------------------------------------------------------------------------
 @st.cache_resource(show_spinner="Loading historic file…")
 def _load_historic_cached(_key, path_or_buffer) -> pd.DataFrame:
-    xl = pd.ExcelFile(path_or_buffer)
+    xl = pd.ExcelFile(path_or_buffer, engine="calamine")
     sheet = xl.sheet_names[0]
     df = pd.read_excel(xl, sheet_name=sheet)
     df.columns = [c.strip() for c in df.columns]
@@ -317,7 +363,7 @@ def load_historic(path_or_buffer):
 
 @st.cache_resource(show_spinner="Loading MTD file…")
 def _load_mtd_cached(_key, path_or_buffer) -> pd.DataFrame:
-    df = pd.read_excel(path_or_buffer, sheet_name="Data")
+    df = pd.read_excel(path_or_buffer, sheet_name="Data", engine="calamine")
     df.columns = [c.strip() for c in df.columns]
     df["Platform"] = df["CustGroup"].map(PLATFORM_MAP).fillna("Other")
     df["Category"] = df["ItemCategory"].map(CATEGORY_MAP).fillna("Other")
@@ -428,7 +474,7 @@ def load_mfilterit_data(pricing_path, availability_path):
 # ---- Keeta + Ninja loaders ------------------------------------------------
 @st.cache_resource(show_spinner="Loading Keeta tracker…")
 def _load_keeta_cached(_key, path_or_buffer):
-    xl = pd.ExcelFile(path_or_buffer)
+    xl = pd.ExcelFile(path_or_buffer, engine="calamine")
     loc_raw = pd.read_excel(xl, sheet_name="Locations Key", header=None)
     header_row = None
     for i, row in loc_raw.iterrows():
@@ -506,7 +552,7 @@ def load_keeta_tracker(path_or_buffer):
 
 @st.cache_resource(show_spinner="Loading Ninja tracker…")
 def _load_ninja_cached(_key, path_or_buffer):
-    xl = pd.ExcelFile(path_or_buffer)
+    xl = pd.ExcelFile(path_or_buffer, engine="calamine")
     rows = []
     for sheet in xl.sheet_names:
         if sheet == "Locations Key":
@@ -585,7 +631,11 @@ def _build_combined_price(_pkey, _kkey, _nkey, base_price, keeta_price, ninja_pr
         common_cols &= set(p.columns)
     common_cols = list(common_cols)
     out = pd.concat([p[common_cols] for p in parts], ignore_index=True)
-    return _to_categorical(out, ["Platform", "Brand", "Category", "Type"])
+    out = _to_categorical(out, ["Platform", "Brand", "Category", "Type"])
+    # Apply category remap inside the cached builder so the returned object
+    # is stable across reruns (id() doesn't change).
+    out = _apply_category_remap(out)
+    return out
 
 
 @st.cache_resource(show_spinner=False)
@@ -608,7 +658,9 @@ def _build_combined_avail(_pkey, _kkey, _nkey, base_avail, keeta_avail, ninja_av
         common_cols &= set(p.columns)
     common_cols = list(common_cols)
     out = pd.concat([p[common_cols] for p in parts], ignore_index=True)
-    return _to_categorical(out, ["Platform", "Brand", "Category", "Store"])
+    out = _to_categorical(out, ["Platform", "Brand", "Category", "Store"])
+    out = _apply_category_remap(out)
+    return out
 
 
 @st.cache_resource(show_spinner=False)
@@ -825,6 +877,241 @@ def _build_pricing_trend_fig(
                     y=1.02, xanchor="right", x=1),
     )
     return fig
+
+
+# ---------------------------------------------------------------------------
+# Cached AVAILABILITY builders (drill HTML + bar chart)
+# Same pattern as the pricing builders above.
+# ---------------------------------------------------------------------------
+@st.cache_resource(show_spinner=False, max_entries=32)
+def _build_availability_drill_html(
+    cache_token,
+    plat: str, store: str, cat: str, brand: str,
+    d_from: date, d_to: date,
+    comp_from: date, comp_to: date,
+    mtd_start: date, ytd_start: date,
+):
+    """Build the entire availability drill-tree HTML (and overall %) once,
+    cache it. Cache key = filters + all date ranges. Same selection = instant
+    return on subsequent reruns."""
+    indexed = _filter_and_index_availability(
+        avail_df, cache_token, plat, store, cat, brand,
+    )
+    af_main = _slice_by_date(indexed, d_from, d_to)
+    af_comp = _slice_by_date(indexed, comp_from, comp_to)
+    af_mtd  = _slice_by_date(indexed, mtd_start, d_to)
+    af_ytd  = _slice_by_date(indexed, ytd_start, d_to)
+
+    if af_main is None or af_main.empty:
+        return None
+
+    overall_avail = float(af_main["Availability"].mean() * 100)
+
+    has_store = "Store" in af_main.columns and af_main["Store"].notna().any()
+    has_sku   = "SKU"   in af_main.columns and af_main["SKU"].notna().any()
+    has_brand = "Brand" in af_main.columns and af_main["Brand"].notna().any()
+    hierarchy = (["Platform", "Category"]
+                 + (["Brand"] if has_brand else [])
+                 + (["SKU"]   if has_sku   else [])
+                 + (["Store"] if has_store else []))
+
+    main_vals, main_kids = _hier_aggregate(af_main, hierarchy, "Availability", multiplier=100.0)
+    comp_vals, _ = _hier_aggregate(af_comp, hierarchy, "Availability", multiplier=100.0)
+    mtd_vals,  _ = _hier_aggregate(af_mtd,  hierarchy, "Availability", multiplier=100.0)
+    ytd_vals,  _ = _hier_aggregate(af_ytd,  hierarchy, "Availability", multiplier=100.0)
+
+    def fmt_avail_pct(v):
+        if pd.isna(v): return "<span style='color:#9ca3af'>—</span>"
+        color = "#E00034" if v < 60 else ("#FF9800" if v < 80 else "#00A651")
+        return f"<span style='color:{color};font-weight:600'>{v:.0f}%</span>"
+
+    def fmt_vs(curr, prev):
+        if pd.isna(curr) or pd.isna(prev):
+            return "<span style='color:#9ca3af'>—</span>"
+        diff = curr - prev
+        if diff > 0:
+            return f"<span style='color:#00A651;font-weight:600'>▲ {diff:+.0f}%</span>"
+        elif diff < 0:
+            return f"<span style='color:#E00034;font-weight:600'>▼ {diff:+.0f}%</span>"
+        return f"<span style='color:{MUTED}'>0%</span>"
+
+    def cells4(level, key):
+        m  = _safe_get(main_vals.get(level, {}), key)
+        c  = _safe_get(comp_vals.get(level, {}), key)
+        mt = _safe_get(mtd_vals.get(level, {}),  key)
+        yt = _safe_get(ytd_vals.get(level, {}),  key)
+        return (f"<span class='num'>{fmt_avail_pct(m)}</span>"
+                f"<span class='num'>{fmt_vs(m, c)}</span>"
+                f"<span class='num'>{fmt_avail_pct(mt)}</span>"
+                f"<span class='num'>{fmt_avail_pct(yt)}</span>")
+
+    def _clean_store(s):
+        return _esc(str(s).replace("_", " ").title())
+
+    def _strip_pcz(s):
+        s = str(s)
+        return _esc(s.split(" PC: Z")[0] if " PC: Z" in s else s)
+
+    parts = ["<div class='drill-tree cols-5'>"]
+    parts.append(
+        "<div class='row header'>"
+        "<span>Platform</span>"
+        "<span class='num'>Availability</span>"
+        "<span class='num'>vs Period</span>"
+        "<span class='num'>MTD</span>"
+        "<span class='num'>YTD</span>"
+        "</div>"
+    )
+
+    plats_sorted = sorted(main_vals[1].items(), key=lambda kv: kv[1], reverse=True)
+    n_levels = len(hierarchy)
+
+    for plat_, _v in plats_sorted:
+        plat_label = _esc(plat_)
+        cat_kids = main_kids.get(2, {}).get(plat_, []) if n_levels >= 2 else []
+
+        if not cat_kids:
+            parts.append(
+                f"<div class='row level-0'>"
+                f"<span><span class='caret-empty'></span> "
+                f"<span class='name'>{plat_label}</span></span>"
+                f"{cells4(1, plat_)}</div>"
+            )
+            continue
+
+        parts.append(
+            f"<details><summary><div class='row level-0'>"
+            f"<span><span class='caret'></span> "
+            f"<span class='name'>{plat_label}</span></span>"
+            f"{cells4(1, plat_)}</div></summary>"
+        )
+
+        for cat_, _ in cat_kids:
+            cat_label = _esc(cat_)
+            brand_kids = main_kids.get(3, {}).get((plat_, cat_), []) if (has_brand and n_levels >= 3) else []
+
+            if not brand_kids:
+                parts.append(
+                    f"<div class='row level-1'>"
+                    f"<span><span class='caret-empty'></span> "
+                    f"<span class='name'>{cat_label}</span></span>"
+                    f"{cells4(2, (plat_, cat_))}</div>"
+                )
+                continue
+
+            parts.append(
+                f"<details><summary><div class='row level-1'>"
+                f"<span><span class='caret'></span> "
+                f"<span class='name'>{cat_label}</span></span>"
+                f"{cells4(2, (plat_, cat_))}</div></summary>"
+            )
+
+            for brand_, _ in brand_kids:
+                brand_label = _esc(brand_)
+                sku_kids = main_kids.get(4, {}).get((plat_, cat_, brand_), []) if (has_sku and n_levels >= 4) else []
+
+                if not sku_kids:
+                    parts.append(
+                        f"<div class='row level-2'>"
+                        f"<span><span class='caret-empty'></span> "
+                        f"<span class='name'>{brand_label}</span></span>"
+                        f"{cells4(3, (plat_, cat_, brand_))}</div>"
+                    )
+                    continue
+
+                parts.append(
+                    f"<details><summary><div class='row level-2'>"
+                    f"<span><span class='caret'></span> "
+                    f"<span class='name'>{brand_label}</span></span>"
+                    f"{cells4(3, (plat_, cat_, brand_))}</div></summary>"
+                )
+
+                for sku_, _ in sku_kids:
+                    sku_label = _strip_pcz(sku_)
+                    store_kids = main_kids.get(5, {}).get((plat_, cat_, brand_, sku_), []) if (has_store and n_levels >= 5) else []
+
+                    if not store_kids:
+                        parts.append(
+                            f"<div class='row level-3'>"
+                            f"<span><span class='caret-empty'></span> "
+                            f"<span class='name'>{sku_label}</span></span>"
+                            f"{cells4(4, (plat_, cat_, brand_, sku_))}</div>"
+                        )
+                        continue
+
+                    parts.append(
+                        f"<details><summary><div class='row level-3'>"
+                        f"<span><span class='caret'></span> "
+                        f"<span class='name'>{sku_label}</span></span>"
+                        f"{cells4(4, (plat_, cat_, brand_, sku_))}</div></summary>"
+                    )
+
+                    for store_, _ in store_kids:
+                        parts.append(
+                            f"<div class='row level-4'>"
+                            f"<span><span class='caret-empty'></span> "
+                            f"<span class='name'>{_clean_store(store_)}</span></span>"
+                            f"{cells4(5, (plat_, cat_, brand_, sku_, store_))}</div>"
+                        )
+                    parts.append("</details>")
+                parts.append("</details>")
+            parts.append("</details>")
+        parts.append("</details>")
+
+    if main_vals[1]:
+        ta = sum(main_vals[1].values()) / len(main_vals[1])
+        tc = (sum(comp_vals[1].values()) / len(comp_vals[1])) if comp_vals[1] else float("nan")
+        tm = (sum(mtd_vals[1].values())  / len(mtd_vals[1]))  if mtd_vals[1]  else float("nan")
+        ty = (sum(ytd_vals[1].values())  / len(ytd_vals[1]))  if ytd_vals[1]  else float("nan")
+        parts.append(
+            f"<div class='row total level-0'>"
+            f"<span><span class='caret-empty'></span> "
+            f"<span class='name'>Total</span></span>"
+            f"<span class='num'>{fmt_avail_pct(ta)}</span>"
+            f"<span class='num'>{fmt_vs(ta, tc)}</span>"
+            f"<span class='num'>{fmt_avail_pct(tm)}</span>"
+            f"<span class='num'>{fmt_avail_pct(ty)}</span>"
+            f"</div>"
+        )
+    parts.append("</div>")
+    return overall_avail, "".join(parts)
+
+
+@st.cache_resource(show_spinner=False, max_entries=32)
+def _build_availability_bar_fig(
+    cache_token,
+    plat: str, store: str, cat: str, brand: str,
+    d_from: date, d_to: date,
+):
+    indexed = _filter_and_index_availability(
+        avail_df, cache_token, plat, store, cat, brand,
+    )
+    af_main = _slice_by_date(indexed, d_from, d_to)
+    if af_main is None or af_main.empty:
+        return None
+
+    plat_vals = (af_main.groupby("Platform", observed=True)["Availability"]
+                 .mean() * 100).sort_values(ascending=False).dropna()
+    if plat_vals.empty:
+        return None
+
+    names = plat_vals.index.astype(str).tolist()
+    values = [round(v, 1) for v in plat_vals.values]
+    fig = go.Figure(go.Bar(
+        x=names, y=values,
+        marker_color=[PLATFORM_COLORS.get(p, "#9CA3AF") for p in names],
+        text=[f"{v:.0f}%" for v in values],
+        textposition="outside",
+    ))
+    fig.update_layout(
+        height=340, margin=dict(l=10, r=10, t=10, b=10),
+        plot_bgcolor="white",
+        yaxis=dict(gridcolor="#e5e7eb", title="Availability %", range=[0, 105]),
+        xaxis=dict(title=""),
+    )
+    return fig
+
+
 # ---------------------------------------------------------------------------
 # Hero
 # ---------------------------------------------------------------------------
@@ -920,7 +1207,10 @@ except Exception:
     pass
 
 
-# Final combined frames
+# Final combined frames (category remap is now done INSIDE the cached
+# combiners above, so the returned objects are stable across reruns —
+# this is what makes downstream `id(price_df)` / `id(avail_df)` cache keys
+# actually hit.)
 price_df = _build_combined_price(
     _path_cache_key(DEFAULT_PRICE),
     _path_cache_key(keeta_src),
@@ -933,56 +1223,6 @@ avail_df = _build_combined_avail(
     _path_cache_key(ninja_src),
     base_avail, keeta_avail, ninja_avail,
 )
-
-# ---------------------------------------------------------------------------
-# Remap raw sub-categories → top-level categories
-# ---------------------------------------------------------------------------
-subcategory_to_main = {
-    "Paste": "Culinary",
-    "MAYONNAISE": "Culinary",
-    "Milk": "Dairy",
-    "Ice Cream": "Frozen",
-    "Ice Cream Stick": "Frozen",
-    "Cone": "Frozen",
-    "Frozen Yogurt / Frozen": "Frozen",
-    "Sandwich": "Snacks",
-    "Letters": "Snacks",
-    "Chips": "Snacks",
-    "Cheese Balls": "Snacks",
-    "Rings": "Snacks",
-    "Dip": "Culinary",
-    "Hot Sauce": "Culinary",
-    "Sauce": "Culinary",
-    "Honey": "Culinary",
-    "Ketchup": "Culinary",
-    "Cream": "Dairy",
-    "Drinks": "Snacks",
-    "Milk Powder": "Dairy",
-    "French Fries / Frozen": "Frozen",
-    "Stick": "Snacks",
-    "Ice Cream Chocolate / Frozen": "Frozen",
-    "Coffee": "Snacks",
-    # Categories produced by the Keeta/Ninja loaders that were missing:
-    "Yoghurt": "Dairy",
-    "Evaporated Milk": "Dairy",
-    "Snacks": "Snacks",
-    "Other": "Other",
-}
-
-def _remap_category(d):
-    if d is None or d.empty:
-        return d
-    d = d.copy()  # don't mutate the cached object
-    raw = d["Category"].astype("string")
-    mapped = raw.map(subcategory_to_main)
-    # Anything not in the dict keeps its original value rather than becoming NaN.
-    d["Category"] = mapped.fillna(raw).astype("category")
-    return d
-
-price_df = _remap_category(price_df)
-avail_df = _remap_category(avail_df)
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -1639,18 +1879,6 @@ if active_tab == "💲 Pricing":
                                        min_value=pr_min_date, max_value=pr_max_date, key="pr_cto")
 
 
-        # Static filters cached once. Date slicing is then a fast O(log n) cut.
-        _pr_indexed = _filter_and_index_pricing(
-            price_df, id(price_df),
-            pr_f_plat, pr_f_brand, pr_f_cat, pr_f_type,
-        )
-        pf_main = _slice_by_date(_pr_indexed, pr_date_from, pr_date_to)
-        pf_comp = _slice_by_date(_pr_indexed, pr_comp_from, pr_comp_to)
-
-        _empty = price_df.iloc[0:0]
-        if pf_main is None: pf_main = _empty
-        if pf_comp is None: pf_comp = _empty
-
         drill_html = _build_pricing_drill_html(
             id(price_df),
             pr_f_plat, pr_f_brand, pr_f_cat, pr_f_type,
@@ -1726,218 +1954,34 @@ if active_tab == "📦 Availability":
         mtd_start = av_date_to.replace(day=1)
         ytd_start = av_date_to.replace(month=1, day=1)
 
-        _av_indexed = _filter_and_index_availability(
-            avail_df, id(avail_df),
+        # All heavy work (filter + 4-period aggregation + HTML build) is cached.
+        # Same filters + dates = instant return on subsequent reruns.
+        result = _build_availability_drill_html(
+            id(avail_df),
             av_f_plat, av_f_store, av_f_cat, av_f_brand,
+            av_date_from, av_date_to, comp_from, comp_to,
+            mtd_start, ytd_start,
         )
-        af_main = _slice_by_date(_av_indexed, av_date_from, av_date_to)
-        af_comp = _slice_by_date(_av_indexed, comp_from, comp_to)
-        af_mtd = _slice_by_date(_av_indexed, mtd_start, av_date_to)
-        af_ytd = _slice_by_date(_av_indexed, ytd_start, av_date_to)
 
-        _empty = avail_df.iloc[0:0]
-        if af_main is None: af_main = _empty
-        if af_comp is None: af_comp = _empty
-        if af_mtd is None: af_mtd = _empty
-        if af_ytd is None: af_ytd = _empty
-        if af_main.empty:
+        if result is None:
             st.info("No availability data for the selected filters.")
         else:
-            overall_avail = af_main["Availability"].mean() * 100
+            overall_avail, drill_html = result
             st.markdown(
                 f"<div style='text-align:center;margin:16px 0;'>"
                 f"<span style='font-size:48px;font-weight:700;color:{NAVY_DARK}'>{overall_avail:.0f}%</span>"
                 f"<br><span style='color:{MUTED};font-size:14px;'>Availability</span></div>",
                 unsafe_allow_html=True,
             )
+            st.markdown(drill_html, unsafe_allow_html=True)
 
-            has_store = "Store" in af_main.columns and af_main["Store"].notna().any()
-            has_sku = "SKU" in af_main.columns and af_main["SKU"].notna().any()
-            has_brand = "Brand" in af_main.columns and af_main["Brand"].notna().any()
-            hierarchy = (["Platform", "Category"]
-                         + (["Brand"] if has_brand else [])
-                         + (["SKU"] if has_sku else [])
-                         + (["Store"] if has_store else []))
-
-            main_vals, main_kids = _hier_aggregate(af_main, hierarchy, "Availability", multiplier=100.0)
-            comp_vals, _ = _hier_aggregate(af_comp, hierarchy, "Availability", multiplier=100.0)
-            mtd_vals,  _ = _hier_aggregate(af_mtd,  hierarchy, "Availability", multiplier=100.0)
-            ytd_vals,  _ = _hier_aggregate(af_ytd,  hierarchy, "Availability", multiplier=100.0)
-
-            def fmt_avail_pct(v):
-                if pd.isna(v): return "<span style='color:#9ca3af'>—</span>"
-                color = "#E00034" if v < 60 else ("#FF9800" if v < 80 else "#00A651")
-                return f"<span style='color:{color};font-weight:600'>{v:.0f}%</span>"
-
-            def fmt_vs(curr, prev):
-                if pd.isna(curr) or pd.isna(prev):
-                    return "<span style='color:#9ca3af'>—</span>"
-                diff = curr - prev
-                if diff > 0:
-                    return f"<span style='color:#00A651;font-weight:600'>▲ {diff:+.0f}%</span>"
-                elif diff < 0:
-                    return f"<span style='color:#E00034;font-weight:600'>▼ {diff:+.0f}%</span>"
-                return f"<span style='color:{MUTED}'>0%</span>"
-
-            def cells4(level, key):
-                m = _safe_get(main_vals.get(level, {}), key)
-                c = _safe_get(comp_vals.get(level, {}), key)
-                mt = _safe_get(mtd_vals.get(level, {}), key)
-                yt = _safe_get(ytd_vals.get(level, {}), key)
-                return (f"<span class='num'>{fmt_avail_pct(m)}</span>"
-                        f"<span class='num'>{fmt_vs(m, c)}</span>"
-                        f"<span class='num'>{fmt_avail_pct(mt)}</span>"
-                        f"<span class='num'>{fmt_avail_pct(yt)}</span>")
-
-            def _clean_store(s):
-                return _esc(str(s).replace("_", " ").title())
-
-            def _strip_pcz(s):
-                s = str(s)
-                return _esc(s.split(" PC: Z")[0] if " PC: Z" in s else s)
-
-            parts = ["<div class='drill-tree cols-5'>"]
-            parts.append(
-                "<div class='row header'>"
-                "<span>Platform</span>"
-                "<span class='num'>Availability</span>"
-                "<span class='num'>vs Period</span>"
-                "<span class='num'>MTD</span>"
-                "<span class='num'>YTD</span>"
-                "</div>"
+            # Platform bar chart (cached)
+            bar_fig = _build_availability_bar_fig(
+                id(avail_df),
+                av_f_plat, av_f_store, av_f_cat, av_f_brand,
+                av_date_from, av_date_to,
             )
-
-            plats_sorted = sorted(main_vals[1].items(), key=lambda kv: kv[1], reverse=True)
-            n_levels = len(hierarchy)
-
-            for plat, _v in plats_sorted:
-                plat_label = _esc(plat)
-                cat_kids = main_kids.get(2, {}).get(plat, []) if n_levels >= 2 else []
-
-                if not cat_kids:
-                    parts.append(
-                        f"<div class='row level-0'>"
-                        f"<span><span class='caret-empty'></span> "
-                        f"<span class='name'>{plat_label}</span></span>"
-                        f"{cells4(1, plat)}</div>"
-                    )
-                    continue
-
-                parts.append(
-                    f"<details><summary><div class='row level-0'>"
-                    f"<span><span class='caret'></span> "
-                    f"<span class='name'>{plat_label}</span></span>"
-                    f"{cells4(1, plat)}</div></summary>"
-                )
-
-                for cat, _ in cat_kids:
-                    cat_label = _esc(cat)
-                    brand_kids = main_kids.get(3, {}).get((plat, cat), []) if (has_brand and n_levels >= 3) else []
-
-                    if not brand_kids:
-                        parts.append(
-                            f"<div class='row level-1'>"
-                            f"<span><span class='caret-empty'></span> "
-                            f"<span class='name'>{cat_label}</span></span>"
-                            f"{cells4(2, (plat, cat))}</div>"
-                        )
-                        continue
-
-                    parts.append(
-                        f"<details><summary><div class='row level-1'>"
-                        f"<span><span class='caret'></span> "
-                        f"<span class='name'>{cat_label}</span></span>"
-                        f"{cells4(2, (plat, cat))}</div></summary>"
-                    )
-
-                    for brand, _ in brand_kids:
-                        brand_label = _esc(brand)
-                        sku_kids = main_kids.get(4, {}).get((plat, cat, brand), []) if (has_sku and n_levels >= 4) else []
-
-                        if not sku_kids:
-                            parts.append(
-                                f"<div class='row level-2'>"
-                                f"<span><span class='caret-empty'></span> "
-                                f"<span class='name'>{brand_label}</span></span>"
-                                f"{cells4(3, (plat, cat, brand))}</div>"
-                            )
-                            continue
-
-                        parts.append(
-                            f"<details><summary><div class='row level-2'>"
-                            f"<span><span class='caret'></span> "
-                            f"<span class='name'>{brand_label}</span></span>"
-                            f"{cells4(3, (plat, cat, brand))}</div></summary>"
-                        )
-
-                        for sku, _ in sku_kids:
-                            sku_label = _strip_pcz(sku)
-                            store_kids = main_kids.get(5, {}).get((plat, cat, brand, sku), []) if (has_store and n_levels >= 5) else []
-
-                            if not store_kids:
-                                parts.append(
-                                    f"<div class='row level-3'>"
-                                    f"<span><span class='caret-empty'></span> "
-                                    f"<span class='name'>{sku_label}</span></span>"
-                                    f"{cells4(4, (plat, cat, brand, sku))}</div>"
-                                )
-                                continue
-
-                            parts.append(
-                                f"<details><summary><div class='row level-3'>"
-                                f"<span><span class='caret'></span> "
-                                f"<span class='name'>{sku_label}</span></span>"
-                                f"{cells4(4, (plat, cat, brand, sku))}</div></summary>"
-                            )
-
-                            for store, _ in store_kids:
-                                parts.append(
-                                    f"<div class='row level-4'>"
-                                    f"<span><span class='caret-empty'></span> "
-                                    f"<span class='name'>{_clean_store(store)}</span></span>"
-                                    f"{cells4(5, (plat, cat, brand, sku, store))}</div>"
-                                )
-                            parts.append("</details>")
-                        parts.append("</details>")
-                    parts.append("</details>")
-                parts.append("</details>")
-
-            # Total
-            if main_vals[1]:
-                ta = sum(main_vals[1].values()) / len(main_vals[1])
-                tc = (sum(comp_vals[1].values()) / len(comp_vals[1])) if comp_vals[1] else float("nan")
-                tm = (sum(mtd_vals[1].values())  / len(mtd_vals[1]))  if mtd_vals[1]  else float("nan")
-                ty = (sum(ytd_vals[1].values())  / len(ytd_vals[1]))  if ytd_vals[1]  else float("nan")
-                parts.append(
-                    f"<div class='row total level-0'>"
-                    f"<span><span class='caret-empty'></span> "
-                    f"<span class='name'>Total</span></span>"
-                    f"<span class='num'>{fmt_avail_pct(ta)}</span>"
-                    f"<span class='num'>{fmt_vs(ta, tc)}</span>"
-                    f"<span class='num'>{fmt_avail_pct(tm)}</span>"
-                    f"<span class='num'>{fmt_avail_pct(ty)}</span>"
-                    f"</div>"
-                )
-            parts.append("</div>")
-            st.markdown("".join(parts), unsafe_allow_html=True)
-
-            # Platform bar chart
-            st.markdown("<div class='sec-title' style='margin-top:24px;'>Availability by Platform</div>",
-                        unsafe_allow_html=True)
-            if main_vals[1]:
-                items = sorted(main_vals[1].items(), key=lambda kv: kv[1], reverse=True)
-                names = [str(k) for k, _ in items]
-                values = [round(v, 1) for _, v in items]
-                fig = go.Figure(go.Bar(
-                    x=names, y=values,
-                    marker_color=[PLATFORM_COLORS.get(p, "#9CA3AF") for p in names],
-                    text=[f"{v:.0f}%" for v in values],
-                    textposition="outside",
-                ))
-                fig.update_layout(height=340, margin=dict(l=10, r=10, t=10, b=10),
-                                  plot_bgcolor="white",
-                                  yaxis=dict(gridcolor="#e5e7eb", title="Availability %", range=[0, 105]),
-                                  xaxis=dict(title=""))
-                st.plotly_chart(fig, use_container_width=True)
-
-
+            if bar_fig is not None:
+                st.markdown("<div class='sec-title' style='margin-top:24px;'>Availability by Platform</div>",
+                            unsafe_allow_html=True)
+                st.plotly_chart(bar_fig, use_container_width=True)
