@@ -29,6 +29,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 
+
 # ---------------------------------------------------------------------------
 # Page config
 # ---------------------------------------------------------------------------
@@ -252,6 +253,85 @@ def _to_categorical(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
+
+import time
+import numpy as np
+import pandas as pd
+from pathlib import Path
+def process_mfilterit_av_pr_file(PRICING_FILE,OSA_FILE):
+# ── CONFIG ─────────────────────────────────────────────────────────────────
+
+    OWN_BRANDS          = ["Saudia", "Crispy"]              # → Type = "Brand"
+    TRACKED_COMPETITORS = ["Almarai", "Nadec"]              # → Type = "Competitor"
+
+    PLATFORM_MAP = {
+        "quickmarket_ksa":      "Hunger Station",
+        "noon_minutes_ksa_app": "Noon",
+    }
+
+    t0 = time.perf_counter()
+
+    # ── 1. AVAILABILITY  (OSA wide → long) ─────────────────────────────────────
+    # OSA "Base Data" has one row per (SKU, store) with one column per date.
+    # Strategy: filter to tracked brands BEFORE melting (≈ 5× speed-up on 14k×46),
+    # then melt the date columns down, drop the days where the platform didn't
+    # scrape that store (NaN), and rename to dashboard schema.
+
+    ID_COLS = ["platform", "brand", "sub_category", "oem_code",
+               "product_code", "title_local", "pincode"]
+
+    osa = pd.read_excel(OSA_FILE, sheet_name="Base Data", engine="calamine")
+    date_cols = [c for c in osa.columns if hasattr(c, "year")]   # datetime cols only
+
+    osa = osa.loc[osa["brand"].isin(OWN_BRANDS), ID_COLS + date_cols]
+
+    a = (osa.melt(id_vars=ID_COLS, value_vars=date_cols,
+                  var_name="Date", value_name="Availability")
+            .dropna(subset=["Availability"]))
+
+    availability = pd.DataFrame({
+        "Brand ":       a["brand"].astype("string"),
+        "Category":     a["sub_category"].astype("string"),
+        "Unit Barcode": pd.to_numeric(a["oem_code"], errors="coerce"),
+        "SKU":          a["title_local"].astype("string") + " PC: " + a["product_code"].astype("string"),
+        "Platform":     a["platform"].map(PLATFORM_MAP).astype("string"),
+        "Store":        a["pincode"].astype("string"),
+        "Date":         pd.to_datetime(a["Date"]).dt.strftime("%d/%m/%Y"),
+        "Availability": a["Availability"].astype("float64"),
+    })
+
+    t1 = time.perf_counter()
+    print(f"Availability built in {t1-t0:5.2f}s · {len(availability):>7,} rows")
+
+    # ── 2. PRICE  (per-store rows → per-(SKU, platform, date) mean MRP) ───────
+    # `usecols` keeps only the 9 columns we need from a 33-col, 115k-row sheet.
+    # We aggregate MRP (the listed price) — that's what the existing dashboard
+    # tracks. Switch to "asp" if you'd rather track post-discount selling price.
+
+    PRICE_USECOLS = ["inserted_date", "platform", "oem_code", "product_code",
+                     "brand", "brand_type", "sub_category", "title_local", "mrp"]
+
+    pricing = pd.read_excel(PRICING_FILE, sheet_name="Base data",
+                            usecols=PRICE_USECOLS, engine="calamine")
+    pricing = pricing[pricing["brand"].isin(OWN_BRANDS + TRACKED_COMPETITORS)]
+
+    GROUP = ["inserted_date", "platform", "brand", "brand_type",
+             "sub_category", "oem_code", "product_code", "title_local"]
+    agg = (pricing.groupby(GROUP, as_index=False, observed=True)
+                  .agg(Price=("mrp", "mean")))
+
+    price_df = pd.DataFrame({
+        "Brand ":       agg["brand"].astype("string"),
+        "Category":     agg["sub_category"].astype("string"),
+        "Unit Barcode": np.nan,                                  # left blank to match existing schema
+        "SKU":          agg["title_local"].astype("string") + " PC: " + agg["product_code"].astype("string"),
+        "Platform":     agg["platform"].map(PLATFORM_MAP).astype("string"),
+        "Date":         pd.to_datetime(agg["inserted_date"]).dt.strftime("%d/%m/%Y"),
+        "Price":        agg["Price"].astype("float64"),
+        "Type":         np.where(agg["brand_type"].eq("Own"), "Brand", "Competitor"),
+    })
+    return price_df,availability
+
 @st.cache_data(show_spinner="Loading historic file…")
 def load_historic(path_or_buffer) -> pd.DataFrame:
     xl = pd.ExcelFile(path_or_buffer)
@@ -351,8 +431,8 @@ def _fix_dates_column(series: pd.Series) -> pd.Series:
 
 
 @st.cache_data(show_spinner="Loading pricing data…")
-def load_pricing(path_or_buffer) -> pd.DataFrame:
-    df = pd.read_excel(path_or_buffer, sheet_name="Price")
+def load_pricing(df) -> pd.DataFrame:
+    #df = pd.read_excel(path_or_buffer, sheet_name="Price")
     df.columns = [c.strip() for c in df.columns]
     df["Date"] = _fix_dates_column(df["Date"])
     df["Price"] = pd.to_numeric(df["Price"], errors="coerce")
@@ -360,8 +440,8 @@ def load_pricing(path_or_buffer) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner="Loading availability data…")
-def load_availability(path_or_buffer) -> pd.DataFrame:
-    df = pd.read_excel(path_or_buffer, sheet_name="Availability")
+def load_availability(df) -> pd.DataFrame:
+    #df = pd.read_excel(path_or_buffer, sheet_name="Availability")
     df.columns = [c.strip() for c in df.columns]
     df["Date"] = _fix_dates_column(df["Date"])
     df["Availability"] = pd.to_numeric(df["Availability"], errors="coerce")
@@ -534,7 +614,7 @@ st.markdown(
 # ---------------------------------------------------------------------------
 DEFAULT_HIST = "Online Shopping 24-26 (1).xlsx"
 DEFAULT_MTD  = "Online Shopping MTD (3).xlsx"
-DEFAULT_DATA_DASH = "Sadafco Data Dashboard (1).xlsx"
+PRICING_DF, AVAILABILITY_DF = process_mfilterit_av_pr_file('mfilterit_pricing.xlsx','mfilterit_availability.xlsx')
 DEFAULT_KEETA = "Sadafco Keeta Manual Tracker.xlsx"
 DEFAULT_NINJA = "Sadafco_Ninja_Manual_Tracker.xlsx"
 
@@ -574,12 +654,12 @@ else:
 if df is not None:
     df["SKU"] = df["SKU_label"]
 
-dd_src = data_dash_upload if data_dash_upload is not None else DEFAULT_DATA_DASH
+# dd_src = data_dash_upload if data_dash_upload is not None else DEFAULT_DATA_DASH
 price_df, avail_df = None, None
 _dd_load_error = None
 try:
-    price_df = load_pricing(dd_src)
-    avail_df = load_availability(dd_src)
+    price_df = load_pricing(PRICING_DF)
+    avail_df = load_availability(AVAILABILITY_DF)
 except Exception as e:
     _dd_load_error = str(e)
 
