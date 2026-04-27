@@ -343,7 +343,7 @@ def load_mtd(path_or_buffer):
     return _load_mtd_cached(_path_cache_key(path_or_buffer), path_or_buffer)
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_resource(show_spinner=False)
 def merge_historic_mtd(hist: pd.DataFrame, mtd: pd.DataFrame) -> pd.DataFrame:
     mtd_periods = mtd[["Year", "MonthNum"]].drop_duplicates()
     mtd_keys = set(zip(mtd_periods["Year"].astype(int),
@@ -565,7 +565,7 @@ def load_ninja_tracker(path_or_buffer):
     return _load_ninja_cached(_path_cache_key(path_or_buffer), path_or_buffer)
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_resource(show_spinner=False)
 def _build_combined_price(_pkey, _kkey, _nkey, base_price, keeta_price, ninja_price):
     parts = []
     if base_price is not None and not base_price.empty:
@@ -611,7 +611,7 @@ def _build_combined_avail(_pkey, _kkey, _nkey, base_avail, keeta_avail, ninja_av
     return _to_categorical(out, ["Platform", "Brand", "Category", "Store"])
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_resource(show_spinner=False)
 def _filter_and_index_pricing(
     _price_df: pd.DataFrame,
     cache_token,
@@ -631,7 +631,7 @@ def _filter_and_index_pricing(
     return f.sort_values("Date").set_index("Date")
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_resource(show_spinner=False)
 def _filter_and_index_availability(
     _avail_df: pd.DataFrame,
     cache_token,
@@ -657,6 +657,174 @@ def _slice_by_date(indexed_df, d_from, d_to):
     hi = pd.Timestamp(d_to) + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
     return indexed_df.loc[lo:hi]
 
+@st.cache_resource(show_spinner=False, max_entries=32)
+def _build_pricing_drill_html(
+    cache_token,
+    plat: str, brand: str, cat: str, typ: str,
+    d_from: date, d_to: date,
+    cd_from: date, cd_to: date,
+):
+    """Build the entire pricing drill-tree HTML once, cache it.
+    Cache key = filters + both date ranges. Same selection = instant return."""
+    indexed = _filter_and_index_pricing(price_df, cache_token, plat, brand, cat, typ)
+    pf_main_local = _slice_by_date(indexed, d_from, d_to)
+    pf_comp_local = _slice_by_date(indexed, cd_from, cd_to)
+    if pf_main_local is None or pf_main_local.empty:
+        return None
+
+    has_sku_l = "SKU" in pf_main_local.columns and pf_main_local["SKU"].notna().any()
+    hierarchy_l = ["Platform", "Brand", "Category"] + (["SKU"] if has_sku_l else [])
+
+    main_v, main_k = _hier_aggregate(pf_main_local, hierarchy_l, "Price")
+    comp_v, _ = _hier_aggregate(pf_comp_local, hierarchy_l, "Price")
+
+    def _fmt_change(curr, prev):
+        if pd.isna(curr) or pd.isna(prev):
+            return "<span style='color:#9ca3af'>—</span>"
+        diff = curr - prev
+        if diff == 0:
+            return "<span style='color:#9ca3af'>SAR 0.00</span>"
+        color = "#E00034" if diff < 0 else "#00A651"
+        return f"<span style='color:{color};font-weight:600'>SAR {diff:+.2f}</span>"
+
+    def _cells(curr, prev):
+        s = f"{curr:.2f}" if pd.notna(curr) else "—"
+        return f"<span class='num'>{s}</span><span class='num'>{_fmt_change(curr, prev)}</span>"
+
+    def _strip(s):
+        s = str(s)
+        return s.split(" PC: Z")[0] if " PC: Z" in s else s
+
+    parts = ["<div class='drill-tree cols-3'>",
+             "<div class='row header'><span>Platform</span>"
+             "<span class='num'>Price (SAR)</span>"
+             "<span class='num'>Change</span></div>"]
+
+    plats_sorted = sorted(main_v[1].items(), key=lambda kv: kv[1], reverse=True)
+    for plat_, plat_vv in plats_sorted:
+        plat_vv = float(plat_vv)
+        plat_cc = _safe_get(comp_v[1], plat_)
+        plat_label = _esc(plat_)
+        brand_kids = main_k.get(2, {}).get(plat_, [])
+        if not brand_kids:
+            parts.append(f"<div class='row level-0'><span><span class='caret-empty'></span> "
+                         f"<span class='name'>{plat_label}</span></span>{_cells(plat_vv, plat_cc)}</div>")
+            continue
+        parts.append(f"<details><summary><div class='row level-0'><span><span class='caret'></span> "
+                     f"<span class='name'>{plat_label}</span></span>{_cells(plat_vv, plat_cc)}</div></summary>")
+        for br_, br_vv in brand_kids:
+            br_cc = _safe_get(comp_v[2], (plat_, br_))
+            br_lab = _esc(br_)
+            cat_kids = main_k.get(3, {}).get((plat_, br_), [])
+            if not cat_kids:
+                parts.append(f"<div class='row level-1'><span><span class='caret-empty'></span> "
+                             f"<span class='name'>{br_lab}</span></span>{_cells(br_vv, br_cc)}</div>")
+                continue
+            parts.append(f"<details><summary><div class='row level-1'><span><span class='caret'></span> "
+                         f"<span class='name'>{br_lab}</span></span>{_cells(br_vv, br_cc)}</div></summary>")
+            for ct_, ct_vv in cat_kids:
+                ct_cc = _safe_get(comp_v[3], (plat_, br_, ct_))
+                ct_lab = _esc(ct_)
+                sku_kids = main_k.get(4, {}).get((plat_, br_, ct_), []) if has_sku_l else []
+                if not sku_kids:
+                    parts.append(f"<div class='row level-2'><span><span class='caret-empty'></span> "
+                                 f"<span class='name'>{ct_lab}</span></span>{_cells(ct_vv, ct_cc)}</div>")
+                    continue
+                parts.append(f"<details><summary><div class='row level-2'><span><span class='caret'></span> "
+                             f"<span class='name'>{ct_lab}</span></span>{_cells(ct_vv, ct_cc)}</div></summary>")
+                for sk_, sk_vv in sku_kids:
+                    sk_cc = _safe_get(comp_v[4], (plat_, br_, ct_, sk_))
+                    sk_lab = _esc(_strip(sk_))
+                    parts.append(f"<div class='row level-3'><span><span class='caret-empty'></span> "
+                                 f"<span class='name'>{sk_lab}</span></span>{_cells(sk_vv, sk_cc)}</div>")
+                parts.append("</details>")
+            parts.append("</details>")
+        parts.append("</details>")
+
+    if main_v[1]:
+        tm = sum(main_v[1].values()) / len(main_v[1])
+    else:
+        tm = float("nan")
+    if comp_v[1]:
+        tc = sum(comp_v[1].values()) / len(comp_v[1])
+    else:
+        tc = float("nan")
+    parts.append(f"<div class='row total level-0'><span><span class='caret-empty'></span> "
+                 f"<span class='name'>Total</span></span>{_cells(tm, tc)}</div>")
+    parts.append("</div>")
+    return "".join(parts)
+
+
+@st.cache_resource(show_spinner=False, max_entries=32)
+def _build_pricing_trend_fig(
+    cache_token,
+    plat: str, brand: str, cat: str, typ: str,
+    d_from: date, d_to: date,
+    cd_from: date, cd_to: date,
+):
+    """Build the day-of-week price trendline figure once and cache it.
+    Returns a Plotly Figure (or None if no data in either range)."""
+    indexed = _filter_and_index_pricing(price_df, cache_token, plat, brand, cat, typ)
+    main_local = _slice_by_date(indexed, d_from, d_to)
+    comp_local = _slice_by_date(indexed, cd_from, cd_to)
+
+    DOW_ORDER = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+    def _avg_by_dow(frame):
+        if frame is None or frame.empty:
+            return pd.DataFrame(columns=["dow", "price", "n_days"])
+        daily = frame.groupby(level=0)["Price"].mean()
+        df_d = pd.DataFrame({
+            "date": pd.to_datetime(daily.index),
+            "price": daily.values,
+        })
+        df_d["dow"] = df_d["date"].dt.day_name().str[:3]
+        grouped = (df_d.groupby("dow")
+                       .agg(price=("price", "mean"),
+                            n_days=("price", "size"))
+                       .reindex(DOW_ORDER)
+                       .reset_index())
+        return grouped.dropna(subset=["price"])
+
+    main_line = _avg_by_dow(main_local)
+    comp_line = _avg_by_dow(comp_local)
+
+    if main_line.empty and comp_line.empty:
+        return None
+
+    fig = go.Figure()
+    if not main_line.empty:
+        fig.add_trace(go.Scatter(
+            x=main_line["dow"], y=main_line["price"],
+            mode="lines+markers",
+            name=f"Main ({d_from:%d %b} – {d_to:%d %b})",
+            line=dict(color=NAVY, width=2.5),
+            marker=dict(size=8),
+            customdata=main_line["n_days"],
+            hovertemplate="<b>%{x}</b><br>Avg SAR %{y:.2f}<br>"
+                          "(%{customdata} day(s) in range)<extra></extra>",
+        ))
+    if not comp_line.empty:
+        fig.add_trace(go.Scatter(
+            x=comp_line["dow"], y=comp_line["price"],
+            mode="lines+markers",
+            name=f"Comparison ({cd_from:%d %b} – {cd_to:%d %b})",
+            line=dict(color=SAUDIA_BLUE, width=2.5, dash="dash"),
+            marker=dict(size=8),
+            customdata=comp_line["n_days"],
+            hovertemplate="<b>%{x}</b><br>Avg SAR %{y:.2f}<br>"
+                          "(%{customdata} day(s) in range)<extra></extra>",
+        ))
+    fig.update_layout(
+        height=380, margin=dict(l=10, r=10, t=10, b=10),
+        plot_bgcolor="white",
+        yaxis=dict(gridcolor="#e5e7eb", title="Average price (SAR)"),
+        xaxis=dict(title="Day of week", gridcolor="#e5e7eb",
+                   categoryorder="array", categoryarray=DOW_ORDER),
+        legend=dict(orientation="h", yanchor="bottom",
+                    y=1.02, xanchor="right", x=1),
+    )
+    return fig
 # ---------------------------------------------------------------------------
 # Hero
 # ---------------------------------------------------------------------------
@@ -703,13 +871,13 @@ try:
     hist_df = load_historic(hist_upload if hist_upload is not None else DEFAULT_HIST)
 except Exception:
     pass
-_mark("after load_historic")
+
 
 try:
     mtd_df = load_mtd(mtd_upload if mtd_upload is not None else DEFAULT_MTD)
 except Exception:
     pass
-_mark("after load_mtd")
+
 
 if hist_df is not None and mtd_df is not None:
     df = merge_historic_mtd(hist_df, mtd_df)
@@ -719,7 +887,7 @@ elif mtd_df is not None:
     df = mtd_df
 else:
     df = None
-_mark("after merge")
+
 
 
 if df is not None:
@@ -732,7 +900,7 @@ try:
     base_price, base_avail = load_mfilterit_data(DEFAULT_PRICE, DEFAULT_AVAIL)
 except Exception as e:
     _dd_load_error = str(e)
-_mark("after load_mfilterit")
+
 
 
 # Keeta + Ninja
@@ -744,13 +912,13 @@ try:
     keeta_price, keeta_avail = load_keeta_tracker(keeta_src)
 except Exception:
     pass
-_mark("after load_keeta")
+
 
 try:
     ninja_price, ninja_avail = load_ninja_tracker(ninja_src)
 except Exception:
     pass
-_mark("after load_ninja")
+
 
 # Final combined frames
 price_df = _build_combined_price(
@@ -814,7 +982,7 @@ def _remap_category(d):
 price_df = _remap_category(price_df)
 avail_df = _remap_category(avail_df)
 
-_mark("after build_combined")
+
 
 
 # ---------------------------------------------------------------------------
@@ -1483,210 +1651,37 @@ if active_tab == "💲 Pricing":
         if pf_main is None: pf_main = _empty
         if pf_comp is None: pf_comp = _empty
 
-        if pf_main.empty:
+        drill_html = _build_pricing_drill_html(
+            id(price_df),
+            pr_f_plat, pr_f_brand, pr_f_cat, pr_f_type,
+            pr_date_from, pr_date_to, pr_comp_from, pr_comp_to,
+        )
+        if drill_html is None:
             st.info("No pricing data for the selected filters.")
         else:
-            has_sku = "SKU" in pf_main.columns and pf_main["SKU"].notna().any()
-            hierarchy = ["Platform", "Brand", "Category"] + (["SKU"] if has_sku else [])
-
-            main_vals, main_kids = _hier_aggregate(pf_main, hierarchy, "Price")
-            comp_vals, _ = _hier_aggregate(pf_comp, hierarchy, "Price")
-
-            def fmt_change(curr, prev):
-                if pd.isna(curr) or pd.isna(prev):
-                    return "<span style='color:#9ca3af'>—</span>"
-                diff = curr - prev
-                if diff == 0:
-                    return "<span style='color:#9ca3af'>SAR 0.00</span>"
-                color = "#E00034" if diff < 0 else "#00A651"
-                return f"<span style='color:{color};font-weight:600'>SAR {diff:+.2f}</span>"
-
-            def cells(curr, prev):
-                price_str = f"{curr:.2f}" if pd.notna(curr) else "—"
-                return (f"<span class='num'>{price_str}</span>"
-                        f"<span class='num'>{fmt_change(curr, prev)}</span>")
-
-            def _strip_pcz(s):
-                s = str(s)
-                return s.split(" PC: Z")[0] if " PC: Z" in s else s
-
-            parts = ["<div class='drill-tree cols-3'>"]
-            parts.append(
-                "<div class='row header'>"
-                "<span>Platform</span>"
-                "<span class='num'>Price (SAR)</span>"
-                "<span class='num'>Change</span>"
-                "</div>"
-            )
-
-            plats_sorted = sorted(main_vals[1].items(), key=lambda kv: kv[1], reverse=True)
-
-            for plat, plat_v in plats_sorted:
-                plat_v = float(plat_v)
-                plat_c = _safe_get(comp_vals[1], plat)
-                plat_label = _esc(plat)
-
-                brand_kids = main_kids.get(2, {}).get(plat, [])
-                if not brand_kids:
-                    parts.append(
-                        f"<div class='row level-0'>"
-                        f"<span><span class='caret-empty'></span> "
-                        f"<span class='name'>{plat_label}</span></span>"
-                        f"{cells(plat_v, plat_c)}</div>"
-                    )
-                    continue
-
-                parts.append(
-                    f"<details><summary><div class='row level-0'>"
-                    f"<span><span class='caret'></span> "
-                    f"<span class='name'>{plat_label}</span></span>"
-                    f"{cells(plat_v, plat_c)}</div></summary>"
-                )
-
-                for brand, brand_v in brand_kids:
-                    brand_c = _safe_get(comp_vals[2], (plat, brand))
-                    brand_label = _esc(brand)
-
-                    cat_kids = main_kids.get(3, {}).get((plat, brand), [])
-                    if not cat_kids:
-                        parts.append(
-                            f"<div class='row level-1'>"
-                            f"<span><span class='caret-empty'></span> "
-                            f"<span class='name'>{brand_label}</span></span>"
-                            f"{cells(brand_v, brand_c)}</div>"
-                        )
-                        continue
-
-                    parts.append(
-                        f"<details><summary><div class='row level-1'>"
-                        f"<span><span class='caret'></span> "
-                        f"<span class='name'>{brand_label}</span></span>"
-                        f"{cells(brand_v, brand_c)}</div></summary>"
-                    )
-
-                    for cat, cat_v in cat_kids:
-                        cat_c = _safe_get(comp_vals[3], (plat, brand, cat))
-                        cat_label = _esc(cat)
-
-                        sku_kids = main_kids.get(4, {}).get((plat, brand, cat), []) if has_sku else []
-                        if not sku_kids:
-                            parts.append(
-                                f"<div class='row level-2'>"
-                                f"<span><span class='caret-empty'></span> "
-                                f"<span class='name'>{cat_label}</span></span>"
-                                f"{cells(cat_v, cat_c)}</div>"
-                            )
-                            continue
-
-                        parts.append(
-                            f"<details><summary><div class='row level-2'>"
-                            f"<span><span class='caret'></span> "
-                            f"<span class='name'>{cat_label}</span></span>"
-                            f"{cells(cat_v, cat_c)}</div></summary>"
-                        )
-
-                        for sku, sku_v in sku_kids:
-                            sku_c = _safe_get(comp_vals[4], (plat, brand, cat, sku))
-                            sku_label = _esc(_strip_pcz(sku))
-                            parts.append(
-                                f"<div class='row level-3'>"
-                                f"<span><span class='caret-empty'></span> "
-                                f"<span class='name'>{sku_label}</span></span>"
-                                f"{cells(sku_v, sku_c)}</div>"
-                            )
-                        parts.append("</details>")
-                    parts.append("</details>")
-                parts.append("</details>")
-
-            # Total
-            if main_vals[1]:
-                total_main = sum(main_vals[1].values()) / len(main_vals[1])
-            else:
-                total_main = float("nan")
-            if comp_vals[1]:
-                total_comp = sum(comp_vals[1].values()) / len(comp_vals[1])
-            else:
-                total_comp = float("nan")
-            parts.append(
-                f"<div class='row total level-0'>"
-                f"<span><span class='caret-empty'></span> "
-                f"<span class='name'>Total</span></span>"
-                f"{cells(total_main, total_comp)}</div>"
-            )
-            parts.append("</div>")
-            st.markdown("".join(parts), unsafe_allow_html=True)
-
-            # -------- Trendline: main vs comparison range --------
+            st.markdown(drill_html, unsafe_allow_html=True)
+            # -------- Trendline: main vs comparison range (cached) --------
             st.markdown("<div class='sec-title' style='margin-top:24px;'>"
                         "Price trend — main vs comparison</div>",
                         unsafe_allow_html=True)
-            st.markdown("<div class='sec-sub'>Daily average price across the current "
-                        "filter selection. Lines are aligned on day-in-range so trend "
-                        "shapes can be compared directly.</div>",
+            st.markdown("<div class='sec-sub'>Average price by day of week. "
+                        "Solid line = main range, dashed = comparison.</div>",
                         unsafe_allow_html=True)
 
-
-            def _daily_avg_with_offset(frame, range_start):
-                """Daily mean price + 1-indexed day offset within the range."""
-                if frame is None or frame.empty:
-                    return pd.DataFrame(columns=["day_offset", "date", "price"])
-                daily = frame.groupby(level=0)["Price"].mean().sort_index()
-                out = pd.DataFrame({
-                    "date": pd.to_datetime(daily.index),
-                    "price": daily.values,
-                })
-                out["day_offset"] = (out["date"] - pd.Timestamp(range_start)).dt.days + 1
-                return out
-
-
-            main_line = _daily_avg_with_offset(pf_main, pr_date_from)
-            comp_line = _daily_avg_with_offset(pf_comp, pr_comp_from)
-
-            if main_line.empty and comp_line.empty:
+            trend_fig = _build_pricing_trend_fig(
+                id(price_df),
+                pr_f_plat, pr_f_brand, pr_f_cat, pr_f_type,
+                pr_date_from, pr_date_to, pr_comp_from, pr_comp_to,
+            )
+            if trend_fig is None:
                 st.info("No daily price observations in either range to plot.")
             else:
-                fig = go.Figure()
-
-                if not main_line.empty:
-                    fig.add_trace(go.Scatter(
-                        x=main_line["day_offset"], y=main_line["price"],
-                        mode="lines+markers",
-                        name=f"Main ({pr_date_from:%d %b} – {pr_date_to:%d %b})",
-                        line=dict(color=NAVY, width=2.5),
-                        marker=dict(size=7),
-                        customdata=main_line["date"].dt.strftime("%d %b %Y"),
-                        hovertemplate="<b>%{customdata}</b><br>"
-                                      "Day %{x} · SAR %{y:.2f}<extra></extra>",
-                    ))
-
-                if not comp_line.empty:
-                    fig.add_trace(go.Scatter(
-                        x=comp_line["day_offset"], y=comp_line["price"],
-                        mode="lines+markers",
-                        name=f"Comparison ({pr_comp_from:%d %b} – {pr_comp_to:%d %b})",
-                        line=dict(color=SAUDIA_BLUE, width=2.5, dash="dash"),
-                        marker=dict(size=7),
-                        customdata=comp_line["date"].dt.strftime("%d %b %Y"),
-                        hovertemplate="<b>%{customdata}</b><br>"
-                                      "Day %{x} · SAR %{y:.2f}<extra></extra>",
-                    ))
-
-                fig.update_layout(
-                    height=380, margin=dict(l=10, r=10, t=10, b=10),
-                    plot_bgcolor="white",
-                    yaxis=dict(gridcolor="#e5e7eb", title="Average price (SAR)"),
-                    xaxis=dict(title="Day in range", gridcolor="#e5e7eb"),
-                    legend=dict(orientation="h", yanchor="bottom",
-                                y=1.02, xanchor="right", x=1),
-                )
-                st.plotly_chart(fig, use_container_width=True)
-        _mark("tab_pricing END")
-
+                st.plotly_chart(trend_fig, use_container_width=True)
 # ===========================================================================
 # TAB 3 — AVAILABILITY
 # ===========================================================================
 if active_tab == "📦 Availability":
-    _mark("tab_availability START")
+
     if avail_df is None or avail_df.empty:
         if _dd_load_error:
             st.error(f"Failed to load availability data: {_dd_load_error}")
@@ -1944,7 +1939,5 @@ if active_tab == "📦 Availability":
                                   yaxis=dict(gridcolor="#e5e7eb", title="Availability %", range=[0, 105]),
                                   xaxis=dict(title=""))
                 st.plotly_chart(fig, use_container_width=True)
-    _mark("tab_availability END")
 
-_mark("END")
-st.sidebar.write(f"Total rerun time: {(time.perf_counter() - _SCRIPT_START)*1000:.0f}ms")
+
