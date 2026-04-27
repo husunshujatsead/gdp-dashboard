@@ -1,19 +1,5 @@
 """
-SADAFCO Online Shopping — Sales Dashboard (Optimized)
-
-Performance fixes vs. original:
-  1. Drill-down (Pricing & Availability) uses native HTML <details>/<summary>.
-     Clicking a caret toggles in the browser — NO Streamlit rerun. Previously
-     every click reran the whole script (incl. excel reload, chart regen, etc).
-  2. Hierarchical aggregates pre-computed once per period via a single groupby
-     per level. Replaces the O(rows × levels) repeated-groupby pattern.
-  3. MTD / YTD / comparison-period slices filtered ONCE up front, not per-row.
-  4. The full drill-down tree is rendered as a single st.markdown HTML string
-     instead of dozens of st.columns + st.button + st.markdown calls per row.
-  5. Platform / Brand / Category / SKU columns set to Categorical dtype for
-     faster groupbys.
-  6. _price_metrics / _avail_metrics vectorized via merge instead of Python
-     loops over groupby objects.
+SADAFCO Online Shopping — Sales Dashboard (Speed-Optimized)
 """
 
 from __future__ import annotations
@@ -22,6 +8,7 @@ import io
 from datetime import date, timedelta
 import datetime as _dt
 import re as _re
+from pathlib import Path
 
 import plotly.express as px
 import plotly.graph_objects as go
@@ -29,7 +16,12 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 
+import time
+_SCRIPT_START = time.perf_counter()
 
+def _mark(label):
+    elapsed = (time.perf_counter() - _SCRIPT_START) * 1000
+    st.sidebar.write(f"{elapsed:>7.0f}ms — {label}")
 # ---------------------------------------------------------------------------
 # Page config
 # ---------------------------------------------------------------------------
@@ -38,6 +30,7 @@ st.set_page_config(
     page_icon="🧊",
     layout="wide",
 )
+
 
 SAUDIA_BLUE = "#009DE0"
 NAVY = "#072E73"
@@ -52,6 +45,7 @@ PLATFORM_COLORS = {
     "Keeta":         "#FFD600",
     "Amazon":        "#FF9900",
     "Hungerstation": "#FF5722",
+    "Hunger Station":"#FF5722",
     "Noon":          "#F6EA00",
     "Careem":        "#00B140",
     "Nana":          "#7C3AED",
@@ -70,16 +64,15 @@ CATEGORY_PALETTE = {
 }
 
 # ---------------------------------------------------------------------------
-# CSS — includes the new drill-tree styles for HTML <details> rendering
+# CSS (unchanged)
 # ---------------------------------------------------------------------------
+
 st.markdown(
     f"""
     <style>
-      /* base */
       .stApp {{ background: {BG}; }}
       header[data-testid="stHeader"] {{ background: transparent; }}
       .block-container {{ padding-top: 1rem; padding-bottom: 2rem; }}
-
       .saudia-hero {{
         background: linear-gradient(180deg, #ffffff 0%, #ffffff 100%);
         border-bottom: 1px solid #e5e7eb;
@@ -90,9 +83,7 @@ st.markdown(
         font-size: 34px; font-weight: 700; color: #111827; margin: 0;
       }}
       .saudia-sub {{ color: {MUTED}; font-size: 13px; margin-top: 2px; }}
-
       .filter-bar {{ padding: 8px 2px 0 2px; }}
-
       .kpi-card {{
         background: #fff; border: 1px solid #e5e7eb;
         border-left: 4px solid {SAUDIA_BLUE};
@@ -100,15 +91,12 @@ st.markdown(
       }}
       .kpi-label {{ color: {MUTED}; font-size: 12px; text-transform: uppercase; letter-spacing: .4px; }}
       .kpi-value {{ color: {NAVY_DARK}; font-size: 26px; font-weight: 700; margin-top: 4px; }}
-
       .sec-title {{
         font-family: Georgia, serif;
         font-size: 22px; font-weight: 700; color: {NAVY_DARK};
         margin: 22px 0 4px 0;
       }}
       .sec-sub {{ color: {MUTED}; font-size: 13px; margin-bottom: 8px; }}
-
-      /* pivot tables */
       .pivot-wrap table {{
           border-collapse: collapse; width: 100%; font-size: 13px;
           table-layout: fixed;
@@ -125,7 +113,6 @@ st.markdown(
       .pos {{ color: {GREEN}; font-weight: 600; }}
       .neg {{ color: {RED};   font-weight: 600; }}
 
-      /* ============== drill-tree (Pricing / Availability) ============== */
       .drill-tree {{
           font-size: 13px; border: 1px solid #e5e7eb; border-radius: 6px;
           overflow: hidden; margin-top: 8px;
@@ -136,7 +123,6 @@ st.markdown(
       }}
       .drill-tree summary::-webkit-details-marker {{ display: none; }}
       .drill-tree summary::marker {{ display: none; }}
-
       .drill-tree .row {{
           display: grid; align-items: center;
           padding: 7px 12px; border-bottom: 1px solid #f1f5f9;
@@ -148,7 +134,6 @@ st.markdown(
           border-bottom: none;
       }}
       .drill-tree .header span {{ padding: 4px 0; }}
-
       .drill-tree .row .name {{
           font-weight: 600; color: {NAVY_DARK};
           white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
@@ -160,7 +145,6 @@ st.markdown(
       .drill-tree .caret::before {{ content: "▶"; }}
       .drill-tree details[open] > summary > .row > .caret::before {{ content: "▼"; }}
       .drill-tree .caret-empty {{ display: inline-block; width: 14px; }}
-
       .drill-tree .level-0 {{ padding-left: 12px; }}
       .drill-tree .level-1 {{ padding-left: 36px; background: #fafafa; }}
       .drill-tree .level-2 {{ padding-left: 60px; background: #f5f7fb; }}
@@ -168,19 +152,15 @@ st.markdown(
       .drill-tree .level-3 .name {{ font-weight: 500; color: {MUTED}; }}
       .drill-tree .level-4 {{ padding-left: 108px; background: #e8edf6; font-size: 12px; color: {MUTED}; }}
       .drill-tree .level-4 .name {{ font-weight: 500; color: {MUTED}; }}
-
       .drill-tree .total {{
           background: #fff !important; border-top: 2px solid {NAVY};
           font-weight: 700;
       }}
       .drill-tree .total .name {{ font-weight: 700; }}
-
-      /* 3-column tree (pricing) */
       .drill-tree.cols-3 .row {{
           grid-template-columns: minmax(220px, 2.4fr) minmax(90px, 110px) minmax(110px, 130px);
           gap: 8px;
       }}
-      /* 5-column tree (availability) */
       .drill-tree.cols-5 .row {{
           grid-template-columns: minmax(220px, 2.4fr) repeat(4, minmax(90px, 120px));
           gap: 8px;
@@ -243,97 +223,62 @@ def _infer_platform(name: str) -> str:
 
 
 def _to_categorical(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
-    """Convert columns to categorical dtype in-place; cheap groupby boost."""
     for c in cols:
         if c in df.columns and df[c].dtype != "category":
             df[c] = df[c].astype("category")
     return df
 
 
+def _path_cache_key(path_or_buffer):
+    if path_or_buffer is None:
+        return None
+    if hasattr(path_or_buffer, "name") and hasattr(path_or_buffer, "size"):
+        return ("upload", path_or_buffer.name, getattr(path_or_buffer, "size", 0))
+    if isinstance(path_or_buffer, (str, Path)):
+        try:
+            p = Path(path_or_buffer)
+            return ("path", str(p), p.stat().st_mtime, p.stat().st_size)
+        except (FileNotFoundError, OSError):
+            return ("path", str(path_or_buffer), None, None)
+    return ("other", str(path_or_buffer))
+
+
 # ---------------------------------------------------------------------------
-# Data loading
+# Date repair
 # ---------------------------------------------------------------------------
+def _parse_date_raw(v):
+    if pd.isna(v):
+        return pd.NaT
+    if isinstance(v, str):
+        return pd.to_datetime(v, dayfirst=True, errors="coerce")
+    if isinstance(v, (_dt.datetime, pd.Timestamp)):
+        return pd.Timestamp(v)
+    return pd.NaT
 
-import time
-import numpy as np
-import pandas as pd
-from pathlib import Path
-def process_mfilterit_av_pr_file(PRICING_FILE,OSA_FILE):
-# ── CONFIG ─────────────────────────────────────────────────────────────────
 
-    OWN_BRANDS          = ["Saudia", "Crispy"]              # → Type = "Brand"
-    TRACKED_COMPETITORS = ["Almarai", "Nadec"]              # → Type = "Competitor"
+def _fix_dates_column(series: pd.Series) -> pd.Series:
+    is_str = series.apply(lambda v: isinstance(v, str))
+    parsed = series.apply(_parse_date_raw)
+    str_months = set(parsed[is_str].dropna().dt.month.unique())
+    if not str_months:
+        return parsed
+    dt_mask = ~is_str & parsed.notna()
+    result = parsed.copy()
+    for idx in result[dt_mask].index:
+        ts = result.at[idx]
+        if ts.month not in str_months and ts.day <= 12 and ts.day in str_months:
+            try:
+                result.at[idx] = pd.Timestamp(year=ts.year, month=ts.day, day=ts.month)
+            except Exception:
+                pass
+    return result
 
-    PLATFORM_MAP = {
-        "quickmarket_ksa":      "Hunger Station",
-        "noon_minutes_ksa_app": "Noon",
-    }
 
-    t0 = time.perf_counter()
-
-    # ── 1. AVAILABILITY  (OSA wide → long) ─────────────────────────────────────
-    # OSA "Base Data" has one row per (SKU, store) with one column per date.
-    # Strategy: filter to tracked brands BEFORE melting (≈ 5× speed-up on 14k×46),
-    # then melt the date columns down, drop the days where the platform didn't
-    # scrape that store (NaN), and rename to dashboard schema.
-
-    ID_COLS = ["platform", "brand", "sub_category", "oem_code",
-               "product_code", "title_local", "pincode"]
-
-    osa = pd.read_excel(OSA_FILE, sheet_name="Base Data", engine="calamine")
-    date_cols = [c for c in osa.columns if hasattr(c, "year")]   # datetime cols only
-
-    osa = osa.loc[osa["brand"].isin(OWN_BRANDS), ID_COLS + date_cols]
-
-    a = (osa.melt(id_vars=ID_COLS, value_vars=date_cols,
-                  var_name="Date", value_name="Availability")
-            .dropna(subset=["Availability"]))
-
-    availability = pd.DataFrame({
-        "Brand ":       a["brand"].astype("string"),
-        "Category":     a["sub_category"].astype("string"),
-        "Unit Barcode": pd.to_numeric(a["oem_code"], errors="coerce"),
-        "SKU":          a["title_local"].astype("string") + " PC: " + a["product_code"].astype("string"),
-        "Platform":     a["platform"].map(PLATFORM_MAP).astype("string"),
-        "Store":        a["pincode"].astype("string"),
-        "Date":         pd.to_datetime(a["Date"]).dt.strftime("%d/%m/%Y"),
-        "Availability": a["Availability"].astype("float64"),
-    })
-
-    t1 = time.perf_counter()
-    print(f"Availability built in {t1-t0:5.2f}s · {len(availability):>7,} rows")
-
-    # ── 2. PRICE  (per-store rows → per-(SKU, platform, date) mean MRP) ───────
-    # `usecols` keeps only the 9 columns we need from a 33-col, 115k-row sheet.
-    # We aggregate MRP (the listed price) — that's what the existing dashboard
-    # tracks. Switch to "asp" if you'd rather track post-discount selling price.
-
-    PRICE_USECOLS = ["inserted_date", "platform", "oem_code", "product_code",
-                     "brand", "brand_type", "sub_category", "title_local", "mrp"]
-
-    pricing = pd.read_excel(PRICING_FILE, sheet_name="Base data",
-                            usecols=PRICE_USECOLS, engine="calamine")
-    pricing = pricing[pricing["brand"].isin(OWN_BRANDS + TRACKED_COMPETITORS)]
-
-    GROUP = ["inserted_date", "platform", "brand", "brand_type",
-             "sub_category", "oem_code", "product_code", "title_local"]
-    agg = (pricing.groupby(GROUP, as_index=False, observed=True)
-                  .agg(Price=("mrp", "mean")))
-
-    price_df = pd.DataFrame({
-        "Brand ":       agg["brand"].astype("string"),
-        "Category":     agg["sub_category"].astype("string"),
-        "Unit Barcode": np.nan,                                  # left blank to match existing schema
-        "SKU":          agg["title_local"].astype("string") + " PC: " + agg["product_code"].astype("string"),
-        "Platform":     agg["platform"].map(PLATFORM_MAP).astype("string"),
-        "Date":         pd.to_datetime(agg["inserted_date"]).dt.strftime("%d/%m/%Y"),
-        "Price":        agg["Price"].astype("float64"),
-        "Type":         np.where(agg["brand_type"].eq("Own"), "Brand", "Competitor"),
-    })
-    return price_df,availability
-
-@st.cache_data(show_spinner="Loading historic file…")
-def load_historic(path_or_buffer) -> pd.DataFrame:
+# ---------------------------------------------------------------------------
+# CACHED LOADERS
+# ---------------------------------------------------------------------------
+@st.cache_resource(show_spinner="Loading historic file…")
+def _load_historic_cached(_key, path_or_buffer) -> pd.DataFrame:
     xl = pd.ExcelFile(path_or_buffer)
     sheet = xl.sheet_names[0]
     df = pd.read_excel(xl, sheet_name=sheet)
@@ -366,8 +311,12 @@ def load_historic(path_or_buffer) -> pd.DataFrame:
     return _to_categorical(out, ["Platform", "Category", "Brand"])
 
 
-@st.cache_data(show_spinner="Loading MTD file…")
-def load_mtd(path_or_buffer) -> pd.DataFrame:
+def load_historic(path_or_buffer):
+    return _load_historic_cached(_path_cache_key(path_or_buffer), path_or_buffer)
+
+
+@st.cache_resource(show_spinner="Loading MTD file…")
+def _load_mtd_cached(_key, path_or_buffer) -> pd.DataFrame:
     df = pd.read_excel(path_or_buffer, sheet_name="Data")
     df.columns = [c.strip() for c in df.columns]
     df["Platform"] = df["CustGroup"].map(PLATFORM_MAP).fillna("Other")
@@ -390,6 +339,10 @@ def load_mtd(path_or_buffer) -> pd.DataFrame:
     return _to_categorical(out, ["Platform", "Category", "Brand"])
 
 
+def load_mtd(path_or_buffer):
+    return _load_mtd_cached(_path_cache_key(path_or_buffer), path_or_buffer)
+
+
 @st.cache_data(show_spinner=False)
 def merge_historic_mtd(hist: pd.DataFrame, mtd: pd.DataFrame) -> pd.DataFrame:
     mtd_periods = mtd[["Year", "MonthNum"]].drop_duplicates()
@@ -402,54 +355,79 @@ def merge_historic_mtd(hist: pd.DataFrame, mtd: pd.DataFrame) -> pd.DataFrame:
     return _to_categorical(out, ["Platform", "Category", "Brand"])
 
 
-def _parse_date_raw(v):
-    if pd.isna(v):
-        return pd.NaT
-    if isinstance(v, str):
-        return pd.to_datetime(v, dayfirst=True, errors="coerce")
-    if isinstance(v, (_dt.datetime, pd.Timestamp)):
-        return pd.Timestamp(v)
-    return pd.NaT
+# ---- mfilterit pricing & availability — combined + cached ------------------
+@st.cache_resource(show_spinner="Loading pricing & availability data…")
+def _load_mfilterit_cached(_pricing_key, _avail_key,
+                           pricing_path: str, availability_path: str):
+    OWN_BRANDS = ["Saudia", "Crispy"]
+    TRACKED_COMPETITORS = ["Almarai", "Nadec"]
+    PLATFORM_MAP_MF = {
+        "quickmarket_ksa":      "Hunger Station",
+        "noon_minutes_ksa_app": "Noon",
+    }
+
+    # 1. AVAILABILITY (OSA wide → long)
+    ID_COLS = ["platform", "brand", "sub_category", "oem_code",
+               "product_code", "title_local", "pincode"]
+    osa = pd.read_excel(availability_path, sheet_name="Base Data", engine="calamine")
+    date_cols = [c for c in osa.columns if hasattr(c, "year")]
+    osa = osa.loc[osa["brand"].isin(OWN_BRANDS), ID_COLS + date_cols]
+
+    a = (osa.melt(id_vars=ID_COLS, value_vars=date_cols,
+                  var_name="Date", value_name="Availability")
+            .dropna(subset=["Availability"]))
+
+    availability = pd.DataFrame({
+        "Brand":        a["brand"].astype("string"),
+        "Category":     a["sub_category"].astype("string"),
+        "Unit Barcode": pd.to_numeric(a["oem_code"], errors="coerce"),
+        "SKU":          a["title_local"].astype("string") + " PC: " + a["product_code"].astype("string"),
+        "Platform":     a["platform"].map(PLATFORM_MAP_MF).astype("string"),
+        "Store":        a["pincode"].astype("string"),
+        "Date":         pd.to_datetime(a["Date"], errors="coerce"),
+        "Availability": pd.to_numeric(a["Availability"], errors="coerce"),
+    })
+
+    # 2. PRICE
+    PRICE_USECOLS = ["inserted_date", "platform", "oem_code", "product_code",
+                     "brand", "brand_type", "sub_category", "title_local", "mrp"]
+    pricing = pd.read_excel(pricing_path, sheet_name="Base data",
+                            usecols=PRICE_USECOLS, engine="calamine")
+    pricing = pricing[pricing["brand"].isin(OWN_BRANDS + TRACKED_COMPETITORS)]
+
+    GROUP = ["inserted_date", "platform", "brand", "brand_type",
+             "sub_category", "oem_code", "product_code", "title_local"]
+    agg = (pricing.groupby(GROUP, as_index=False, observed=True)
+                  .agg(Price=("mrp", "mean")))
+
+    price_df = pd.DataFrame({
+        "Brand":        agg["brand"].astype("string"),
+        "Category":     agg["sub_category"].astype("string"),
+        "Unit Barcode": np.nan,
+        "SKU":          agg["title_local"].astype("string") + " PC: " + agg["product_code"].astype("string"),
+        "Platform":     agg["platform"].map(PLATFORM_MAP_MF).astype("string"),
+        "Date":         pd.to_datetime(agg["inserted_date"], errors="coerce"),
+        "Price":        pd.to_numeric(agg["Price"], errors="coerce"),
+        "Type":         np.where(agg["brand_type"].eq("Own"), "Brand", "Competitor"),
+    })
 
 
-def _fix_dates_column(series: pd.Series) -> pd.Series:
-    is_str = series.apply(lambda v: isinstance(v, str))
-    parsed = series.apply(_parse_date_raw)
-    str_months = set(parsed[is_str].dropna().dt.month.unique())
-    if not str_months:
-        return parsed
-    dt_mask = ~is_str & parsed.notna()
-    result = parsed.copy()
-    for idx in result[dt_mask].index:
-        ts = result.at[idx]
-        if ts.month not in str_months and ts.day <= 12 and ts.day in str_months:
-            try:
-                result.at[idx] = pd.Timestamp(year=ts.year, month=ts.day, day=ts.month)
-            except Exception:
-                pass
-    return result
+    price_df = _to_categorical(price_df, ["Platform", "Brand", "Category", "Type"])
+    availability = _to_categorical(availability, ["Platform", "Brand", "Category", "Store"])
+    return price_df, availability
 
 
-@st.cache_data(show_spinner="Loading pricing data…")
-def load_pricing(df) -> pd.DataFrame:
-    #df = pd.read_excel(path_or_buffer, sheet_name="Price")
-    df.columns = [c.strip() for c in df.columns]
-    df["Date"] = _fix_dates_column(df["Date"])
-    df["Price"] = pd.to_numeric(df["Price"], errors="coerce")
-    return _to_categorical(df, ["Platform", "Brand", "Category", "Type"])
+def load_mfilterit_data(pricing_path, availability_path):
+    return _load_mfilterit_cached(
+        _path_cache_key(pricing_path),
+        _path_cache_key(availability_path),
+        pricing_path, availability_path,
+    )
 
 
-@st.cache_data(show_spinner="Loading availability data…")
-def load_availability(df) -> pd.DataFrame:
-    #df = pd.read_excel(path_or_buffer, sheet_name="Availability")
-    df.columns = [c.strip() for c in df.columns]
-    df["Date"] = _fix_dates_column(df["Date"])
-    df["Availability"] = pd.to_numeric(df["Availability"], errors="coerce")
-    return _to_categorical(df, ["Platform", "Brand", "Category", "Store"])
-
-
-@st.cache_data(show_spinner="Loading Keeta tracker…")
-def load_keeta_tracker(path_or_buffer):
+# ---- Keeta + Ninja loaders ------------------------------------------------
+@st.cache_resource(show_spinner="Loading Keeta tracker…")
+def _load_keeta_cached(_key, path_or_buffer):
     xl = pd.ExcelFile(path_or_buffer)
     loc_raw = pd.read_excel(xl, sheet_name="Locations Key", header=None)
     header_row = None
@@ -522,22 +500,12 @@ def load_keeta_tracker(path_or_buffer):
     return keeta_price, keeta_avail
 
 
-@st.cache_data(show_spinner="Loading Ninja tracker…")
-def load_ninja_tracker(path_or_buffer):
-    """Load the Ninja Manual Tracker — same output schema as Keeta so the
-    two can be concatenated transparently into price_df / avail_df.
+def load_keeta_tracker(path_or_buffer):
+    return _load_keeta_cached(_path_cache_key(path_or_buffer), path_or_buffer)
 
-    Layout differences vs Keeta:
-      - Column A is empty on every sheet (data starts at column B). We use
-        usecols="B:F" so we only pick up SKU, Availability, Price,
-        Discounted Price, Discount Percentage and ignore the small legend
-        on columns H–I.
-      - Sheet names use " - " separator (e.g. "Khobar - Danah") so the city
-        is just the first token. The Locations Key sheet uses a different
-        format ("Khobar Danah") so we don't need to consult it.
-      - Brand/category inference is the same as Keeta — the SKU naming
-        convention is identical across the two trackers.
-    """
+
+@st.cache_resource(show_spinner="Loading Ninja tracker…")
+def _load_ninja_cached(_key, path_or_buffer):
     xl = pd.ExcelFile(path_or_buffer)
     rows = []
     for sheet in xl.sheet_names:
@@ -545,7 +513,6 @@ def load_ninja_tracker(path_or_buffer):
             continue
         sdf = pd.read_excel(xl, sheet_name=sheet, usecols="B:F", header=0)
         sdf.columns = [str(c).strip() for c in sdf.columns]
-        # Empty rows separate brand groups within each sheet — drop them.
         sdf = sdf.dropna(subset=["SKU"])
         sdf["Store"] = sheet
         sdf["City"] = sheet.split(" - ")[0].strip() if " - " in sheet else "Unknown"
@@ -558,7 +525,7 @@ def load_ninja_tracker(path_or_buffer):
     raw = raw.dropna(subset=["SKU"])
     snap_date = pd.Timestamp(date.today() - timedelta(days=1))
 
-    def _ninja_brand(sku):
+    def _brand(sku):
         s = str(sku).lower()
         for kw, brand in [("saudia","Saudia"),("nadec","Nadec"),("almarai","Almarai"),
                           ("al safi","Al Safi"),("lays","Lays"),("al batal","Al Batal"),
@@ -568,7 +535,7 @@ def load_ninja_tracker(path_or_buffer):
             if kw in s: return brand
         return "Other"
 
-    def _ninja_category(sku):
+    def _category(sku):
         s = str(sku).lower()
         for kw, cat in [("milk","Milk"),("ice cream","Ice Cream"),("sandwich","Ice Cream"),
                         ("tomato paste","Paste"),("paste","Paste"),("ketchup","Ketchup"),
@@ -579,8 +546,8 @@ def load_ninja_tracker(path_or_buffer):
             return "Snacks"
         return "Other"
 
-    raw["Brand"] = raw["SKU"].apply(_ninja_brand)
-    raw["Category"] = raw["SKU"].apply(_ninja_category)
+    raw["Brand"] = raw["SKU"].apply(_brand)
+    raw["Category"] = raw["SKU"].apply(_category)
     raw["Type"] = raw["Brand"].apply(lambda b: "Brand" if b in ("Saudia","Crispy") else "Competitor")
     raw["Platform"] = "Ninja"
     raw["Date"] = snap_date
@@ -593,6 +560,102 @@ def load_ninja_tracker(path_or_buffer):
     ninja_avail["Availability"] = pd.to_numeric(ninja_avail["Availability"], errors="coerce")
     return ninja_price, ninja_avail
 
+
+def load_ninja_tracker(path_or_buffer):
+    return _load_ninja_cached(_path_cache_key(path_or_buffer), path_or_buffer)
+
+
+@st.cache_data(show_spinner=False)
+def _build_combined_price(_pkey, _kkey, _nkey, base_price, keeta_price, ninja_price):
+    parts = []
+    if base_price is not None and not base_price.empty:
+        parts.append(base_price)
+    if keeta_price is not None and not keeta_price.empty:
+        common = [c for c in (parts[0].columns if parts else keeta_price.columns)
+                  if c in keeta_price.columns]
+        parts.append(keeta_price[common] if parts else keeta_price)
+    if ninja_price is not None and not ninja_price.empty:
+        common = [c for c in (parts[0].columns if parts else ninja_price.columns)
+                  if c in ninja_price.columns]
+        parts.append(ninja_price[common] if parts else ninja_price)
+    if not parts:
+        return None
+    common_cols = set(parts[0].columns)
+    for p in parts[1:]:
+        common_cols &= set(p.columns)
+    common_cols = list(common_cols)
+    out = pd.concat([p[common_cols] for p in parts], ignore_index=True)
+    return _to_categorical(out, ["Platform", "Brand", "Category", "Type"])
+
+
+@st.cache_resource(show_spinner=False)
+def _build_combined_avail(_pkey, _kkey, _nkey, base_avail, keeta_avail, ninja_avail):
+    parts = []
+    if base_avail is not None and not base_avail.empty:
+        parts.append(base_avail)
+    if keeta_avail is not None and not keeta_avail.empty:
+        common = [c for c in (parts[0].columns if parts else keeta_avail.columns)
+                  if c in keeta_avail.columns]
+        parts.append(keeta_avail[common] if parts else keeta_avail)
+    if ninja_avail is not None and not ninja_avail.empty:
+        common = [c for c in (parts[0].columns if parts else ninja_avail.columns)
+                  if c in ninja_avail.columns]
+        parts.append(ninja_avail[common] if parts else ninja_avail)
+    if not parts:
+        return None
+    common_cols = set(parts[0].columns)
+    for p in parts[1:]:
+        common_cols &= set(p.columns)
+    common_cols = list(common_cols)
+    out = pd.concat([p[common_cols] for p in parts], ignore_index=True)
+    return _to_categorical(out, ["Platform", "Brand", "Category", "Store"])
+
+
+@st.cache_data(show_spinner=False)
+def _filter_and_index_pricing(
+    _price_df: pd.DataFrame,
+    cache_token,
+    plat: str, brand: str, cat: str, typ: str,
+):
+    if _price_df is None or _price_df.empty:
+        return None
+    mask = pd.Series(True, index=_price_df.index)
+    if plat  != "All": mask &= (_price_df["Platform"] == plat)
+    if brand != "All": mask &= (_price_df["Brand"]    == brand)
+    if cat   != "All": mask &= (_price_df["Category"] == cat)
+    if typ   != "All" and "Type" in _price_df.columns:
+        mask &= (_price_df["Type"] == typ)
+    f = _price_df[mask]
+    if f.empty or "Date" not in f.columns:
+        return None
+    return f.sort_values("Date").set_index("Date")
+
+
+@st.cache_data(show_spinner=False)
+def _filter_and_index_availability(
+    _avail_df: pd.DataFrame,
+    cache_token,
+    plat: str, store: str, cat: str, brand: str,
+):
+    if _avail_df is None or _avail_df.empty:
+        return None
+    mask = pd.Series(True, index=_avail_df.index)
+    if plat  != "All": mask &= (_avail_df["Platform"] == plat)
+    if store != "All": mask &= (_avail_df["Store"]    == store)
+    if cat   != "All": mask &= (_avail_df["Category"] == cat)
+    if brand != "All": mask &= (_avail_df["Brand"]    == brand)
+    f = _avail_df[mask]
+    if f.empty or "Date" not in f.columns:
+        return None
+    return f.sort_values("Date").set_index("Date")
+
+
+def _slice_by_date(indexed_df, d_from, d_to):
+    if indexed_df is None or indexed_df.empty:
+        return indexed_df if indexed_df is not None else None
+    lo = pd.Timestamp(d_from)
+    hi = pd.Timestamp(d_to) + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
+    return indexed_df.loc[lo:hi]
 
 # ---------------------------------------------------------------------------
 # Hero
@@ -612,9 +675,10 @@ st.markdown(
 # ---------------------------------------------------------------------------
 # Sidebar
 # ---------------------------------------------------------------------------
-DEFAULT_HIST = "Online Shopping 24-26 (1).xlsx"
-DEFAULT_MTD  = "Online Shopping MTD (3).xlsx"
-PRICING_DF, AVAILABILITY_DF = process_mfilterit_av_pr_file('mfilterit_pricing.xlsx','mfilterit_availability.xlsx')
+DEFAULT_HIST  = "Online Shopping 24-26 (1).xlsx"
+DEFAULT_MTD   = "Online Shopping MTD (3).xlsx"
+DEFAULT_PRICE = "mfilterit_pricing.xlsx"
+DEFAULT_AVAIL = "mfilterit_availability.xlsx"
 DEFAULT_KEETA = "Sadafco Keeta Manual Tracker.xlsx"
 DEFAULT_NINJA = "Sadafco_Ninja_Manual_Tracker.xlsx"
 
@@ -628,20 +692,24 @@ with st.sidebar:
     mtd_upload  = st.file_uploader("MTD file (.xlsx)", type=["xlsx"], key="mtd_upload")
     st.markdown("---")
     st.markdown(f"<h3 style='color:{NAVY_DARK};margin-top:0;'>Pricing & Availability</h3>", unsafe_allow_html=True)
-    data_dash_upload = st.file_uploader("Data Dashboard file (.xlsx)", type=["xlsx"], key="data_dash_upload")
     keeta_upload = st.file_uploader("Keeta Manual Tracker (.xlsx)", type=["xlsx"], key="keeta_upload")
     ninja_upload = st.file_uploader("Ninja Manual Tracker (.xlsx)", type=["xlsx"], key="ninja_upload")
 
+# ---------------------------------------------------------------------------
 # Load
+# ---------------------------------------------------------------------------
 hist_df, mtd_df = None, None
 try:
     hist_df = load_historic(hist_upload if hist_upload is not None else DEFAULT_HIST)
 except Exception:
     pass
+_mark("after load_historic")
+
 try:
     mtd_df = load_mtd(mtd_upload if mtd_upload is not None else DEFAULT_MTD)
 except Exception:
     pass
+_mark("after load_mtd")
 
 if hist_df is not None and mtd_df is not None:
     df = merge_historic_mtd(hist_df, mtd_df)
@@ -651,53 +719,102 @@ elif mtd_df is not None:
     df = mtd_df
 else:
     df = None
+_mark("after merge")
+
+
 if df is not None:
     df["SKU"] = df["SKU_label"]
 
-# dd_src = data_dash_upload if data_dash_upload is not None else DEFAULT_DATA_DASH
-price_df, avail_df = None, None
+# mfilterit base
+base_price = base_avail = None
 _dd_load_error = None
 try:
-    price_df = load_pricing(PRICING_DF)
-    avail_df = load_availability(AVAILABILITY_DF)
+    base_price, base_avail = load_mfilterit_data(DEFAULT_PRICE, DEFAULT_AVAIL)
 except Exception as e:
     _dd_load_error = str(e)
+_mark("after load_mfilterit")
 
+
+# Keeta + Ninja
+keeta_price = keeta_avail = pd.DataFrame()
+ninja_price = ninja_avail = pd.DataFrame()
 keeta_src = keeta_upload if keeta_upload is not None else DEFAULT_KEETA
-try:
-    keeta_price, keeta_avail = load_keeta_tracker(keeta_src)
-    if not keeta_price.empty:
-        if price_df is not None:
-            common = [c for c in price_df.columns if c in keeta_price.columns]
-            price_df = pd.concat([price_df[common], keeta_price[common]], ignore_index=True)
-        else:
-            price_df = keeta_price
-    if not keeta_avail.empty:
-        if avail_df is not None:
-            common = [c for c in avail_df.columns if c in keeta_avail.columns]
-            avail_df = pd.concat([avail_df[common], keeta_avail[common]], ignore_index=True)
-        else:
-            avail_df = keeta_avail
-except Exception:
-    pass
-
 ninja_src = ninja_upload if ninja_upload is not None else DEFAULT_NINJA
 try:
-    ninja_price, ninja_avail = load_ninja_tracker(ninja_src)
-    if not ninja_price.empty:
-        if price_df is not None:
-            common = [c for c in price_df.columns if c in ninja_price.columns]
-            price_df = pd.concat([price_df[common], ninja_price[common]], ignore_index=True)
-        else:
-            price_df = ninja_price
-    if not ninja_avail.empty:
-        if avail_df is not None:
-            common = [c for c in avail_df.columns if c in ninja_avail.columns]
-            avail_df = pd.concat([avail_df[common], ninja_avail[common]], ignore_index=True)
-        else:
-            avail_df = ninja_avail
+    keeta_price, keeta_avail = load_keeta_tracker(keeta_src)
 except Exception:
     pass
+_mark("after load_keeta")
+
+try:
+    ninja_price, ninja_avail = load_ninja_tracker(ninja_src)
+except Exception:
+    pass
+_mark("after load_ninja")
+
+# Final combined frames
+price_df = _build_combined_price(
+    _path_cache_key(DEFAULT_PRICE),
+    _path_cache_key(keeta_src),
+    _path_cache_key(ninja_src),
+    base_price, keeta_price, ninja_price,
+)
+avail_df = _build_combined_avail(
+    _path_cache_key(DEFAULT_AVAIL),
+    _path_cache_key(keeta_src),
+    _path_cache_key(ninja_src),
+    base_avail, keeta_avail, ninja_avail,
+)
+
+# ---------------------------------------------------------------------------
+# Remap raw sub-categories → top-level categories
+# ---------------------------------------------------------------------------
+subcategory_to_main = {
+    "Paste": "Culinary",
+    "MAYONNAISE": "Culinary",
+    "Milk": "Dairy",
+    "Ice Cream": "Frozen",
+    "Ice Cream Stick": "Frozen",
+    "Cone": "Frozen",
+    "Frozen Yogurt / Frozen": "Frozen",
+    "Sandwich": "Snacks",
+    "Letters": "Snacks",
+    "Chips": "Snacks",
+    "Cheese Balls": "Snacks",
+    "Rings": "Snacks",
+    "Dip": "Culinary",
+    "Hot Sauce": "Culinary",
+    "Sauce": "Culinary",
+    "Honey": "Culinary",
+    "Ketchup": "Culinary",
+    "Cream": "Dairy",
+    "Drinks": "Snacks",
+    "Milk Powder": "Dairy",
+    "French Fries / Frozen": "Frozen",
+    "Stick": "Snacks",
+    "Ice Cream Chocolate / Frozen": "Frozen",
+    "Coffee": "Snacks",
+    # Categories produced by the Keeta/Ninja loaders that were missing:
+    "Yoghurt": "Dairy",
+    "Evaporated Milk": "Dairy",
+    "Snacks": "Snacks",
+    "Other": "Other",
+}
+
+def _remap_category(d):
+    if d is None or d.empty:
+        return d
+    d = d.copy()  # don't mutate the cached object
+    raw = d["Category"].astype("string")
+    mapped = raw.map(subcategory_to_main)
+    # Anything not in the dict keeps its original value rather than becoming NaN.
+    d["Category"] = mapped.fillna(raw).astype("category")
+    return d
+
+price_df = _remap_category(price_df)
+avail_df = _remap_category(avail_df)
+
+_mark("after build_combined")
 
 
 # ---------------------------------------------------------------------------
@@ -712,13 +829,30 @@ def human(n: float) -> str:
     return f"{n:,.0f}"
 
 
-tab_sales, tab_pricing, tab_availability = st.tabs(["📊 Sales Tracker", "💲 Pricing", "📦 Availability"])
+def _date_mask(date_series: pd.Series, d_from: date, d_to: date) -> pd.Series:
+    if d_from is None and d_to is None:
+        return pd.Series(True, index=date_series.index)
+    from_ts = pd.Timestamp(d_from)
+    to_ts = pd.Timestamp(d_to) + pd.Timedelta(days=1)
+    return (date_series >= from_ts) & (date_series < to_ts)
 
+_mark("before tabs")
+
+
+_TAB_OPTIONS = ["📊 Sales Tracker", "💲 Pricing", "📦 Availability"]
+active_tab = st.radio(
+    "View",
+    _TAB_OPTIONS,
+    horizontal=True,
+    label_visibility="collapsed",
+    key="active_tab",
+)
+st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
 
 # ===========================================================================
 # TAB 1 — SALES TRACKER
 # ===========================================================================
-with tab_sales:
+if active_tab == "📊 Sales Tracker":
     if df is None:
         st.info("No sales data found. Upload the historic and/or MTD workbooks via the sidebar.")
     else:
@@ -757,16 +891,13 @@ with tab_sales:
             st.session_state.df_to = f_date_to
         st.markdown("</div>", unsafe_allow_html=True)
 
-        # Build mask vectorized
-        date_arr = df["Date"].dt.date
-        mask = (date_arr >= f_date_from) & (date_arr <= f_date_to)
-        if f_platform != "All": mask &= df["Platform"].astype(str) == f_platform
-        if f_brand    != "All": mask &= df["Brand"].astype(str) == f_brand
-        if f_category != "All": mask &= df["Category"].astype(str) == f_category
-        if f_sku      != "All": mask &= df["SKU"].astype(str) == f_sku
+        mask = _date_mask(df["Date"], f_date_from, f_date_to)
+        if f_platform != "All": mask &= (df["Platform"] == f_platform)
+        if f_brand    != "All": mask &= (df["Brand"]    == f_brand)
+        if f_category != "All": mask &= (df["Category"] == f_category)
+        if f_sku      != "All": mask &= (df["SKU"]      == f_sku)
         fdf = df[mask]
 
-        # KPIs
         total_sales = fdf["Sales Val"].sum()
         total_units = fdf["Sales Qty"].sum()
         n_platforms = fdf["Platform"].nunique()
@@ -830,7 +961,6 @@ with tab_sales:
                               xaxis=dict(title=""))
             st.plotly_chart(fig, use_container_width=True)
 
-        # Top-5 platform trend
         st.markdown("<div class='sec-title'>Category trend by platform — top 5 platforms</div>", unsafe_allow_html=True)
         st.markdown("<div class='sec-sub'>Monthly sales value split by category, one panel per category, lines colored by platform.</div>", unsafe_allow_html=True)
         top5 = (fdf.groupby("Platform", observed=True)["Sales Val"].sum()
@@ -858,7 +988,7 @@ with tab_sales:
                               plot_bgcolor="white", legend_title_text="Platform")
             st.plotly_chart(fig, use_container_width=True)
 
-        # ----- YoY (vectorized) -----
+        # ----- YoY -----
         _sel_months = []
         if fdf["Date"].notna().any():
             _sel_ym = fdf[["Year", "MonthNum"]].drop_duplicates()
@@ -872,12 +1002,11 @@ with tab_sales:
             cy_year = py_year = None
             cy_month_nums = []
 
-        # YoY base — apply dropdown filters but NOT date range (vectorized once)
         yoy_mask = pd.Series(True, index=df.index)
-        if f_platform != "All": yoy_mask &= df["Platform"].astype(str) == f_platform
-        if f_brand    != "All": yoy_mask &= df["Brand"].astype(str) == f_brand
-        if f_category != "All": yoy_mask &= df["Category"].astype(str) == f_category
-        if f_sku      != "All": yoy_mask &= df["SKU"].astype(str) == f_sku
+        if f_platform != "All": yoy_mask &= (df["Platform"] == f_platform)
+        if f_brand    != "All": yoy_mask &= (df["Brand"]    == f_brand)
+        if f_category != "All": yoy_mask &= (df["Category"] == f_category)
+        if f_sku      != "All": yoy_mask &= (df["SKU"]      == f_sku)
         yoy_base = df[yoy_mask]
 
         yoy_rows = []
@@ -896,8 +1025,6 @@ with tab_sales:
                 unsafe_allow_html=True,
             )
             cy_months_abr = [MONTH_NUM_TO_ABR[mn] for mn in cy_month_nums if mn in MONTH_NUM_TO_ABR]
-
-            # Pre-compute per-month max-day in CY (single pass)
             cy_slice = yoy_base[yoy_base["Year"] == cy_year]
             max_days = cy_slice.groupby("Month", observed=True)["Day"].max()
 
@@ -952,7 +1079,6 @@ with tab_sales:
                     unsafe_allow_html=True,
                 )
 
-                # YoY by platform per month — vectorized
                 for row in yoy_rows:
                     m = row["Month"]
                     max_day = int(max_days[m])
@@ -988,7 +1114,6 @@ with tab_sales:
                                       xaxis=dict(title=""), legend_title_text="Year")
                     st.plotly_chart(fig, use_container_width=True)
 
-                    # Platform × Category YoY breakdown
                     cy_pc = (cy_slice[cy_slice["Month"] == m]
                              .groupby(["Platform", "Category"], observed=True)["Sales Val"].sum()
                              .rename("CY"))
@@ -1054,12 +1179,11 @@ with tab_sales:
         st.markdown("<h2 class='sec-title' style='margin-top:28px;'>Platform Wise Sales</h2>", unsafe_allow_html=True)
         st.markdown("<div class='sec-sub'>Sum of Sales Val by Platform × Month</div>", unsafe_allow_html=True)
 
-        # Pivot base — apply dropdown filters but not date range (one shot)
         pv_mask = pd.Series(True, index=df.index)
-        if f_platform != "All": pv_mask &= df["Platform"].astype(str) == f_platform
-        if f_brand    != "All": pv_mask &= df["Brand"].astype(str) == f_brand
-        if f_category != "All": pv_mask &= df["Category"].astype(str) == f_category
-        if f_sku      != "All": pv_mask &= df["SKU"].astype(str) == f_sku
+        if f_platform != "All": pv_mask &= (df["Platform"] == f_platform)
+        if f_brand    != "All": pv_mask &= (df["Brand"]    == f_brand)
+        if f_category != "All": pv_mask &= (df["Category"] == f_category)
+        if f_sku      != "All": pv_mask &= (df["SKU"]      == f_sku)
         pivot_base = df[pv_mask]
 
         available_years = sorted(pivot_base["Year"].dropna().unique().astype(int), reverse=True)
@@ -1174,7 +1298,6 @@ with tab_sales:
                 unsafe_allow_html=True,
             )
 
-            # Platform breakdown — single groupby
             st.markdown("<div class='sec-title' style='margin-top:18px;'>Platform breakdown</div>", unsafe_allow_html=True)
             pvol_rows = []
             for label, spec in VOLUME_BUCKETS.items():
@@ -1204,7 +1327,6 @@ with tab_sales:
                     unsafe_allow_html=True,
                 )
 
-        # Download
         def build_excel():
             out = io.BytesIO()
             with pd.ExcelWriter(out, engine="openpyxl") as xl:
@@ -1228,51 +1350,74 @@ with tab_sales:
 
 
 # ===========================================================================
-# Drill-tree helpers (shared by Pricing and Availability tabs)
+# Drill-tree helpers
 # ===========================================================================
 def _esc(s) -> str:
-    """Minimal HTML escape — drill-tree text only, no rich formatting."""
     return (str(s).replace("&", "&amp;").replace("<", "&lt;")
                   .replace(">", "&gt;").replace('"', "&quot;"))
 
 
-def _get_loc(series: pd.Series, key) -> float:
-    """Safely fetch from a (possibly multi-index) Series. Returns NaN if missing."""
-    if series is None or series.empty:
-        return float("nan")
-    try:
-        v = series.loc[key]
-        return float(v) if not isinstance(v, pd.Series) else float("nan")
-    except (KeyError, TypeError):
-        return float("nan")
+def _hier_aggregate(df: pd.DataFrame, hierarchy: list[str], value_col: str,
+                    multiplier: float = 1.0):
+    value_dicts: dict[int, dict] = {}
+    children_map: dict[int, dict] = {}
 
-
-def _hier_means(df: pd.DataFrame, hierarchy: list[str], value_col: str,
-                multiplier: float = 1.0) -> dict[int, pd.Series]:
-    """Compute mean of `value_col` at each prefix-level of `hierarchy`.
-    Returns dict {1: Series indexed by hierarchy[:1], 2: ..., etc.}."""
-    out: dict[int, pd.Series] = {}
-    if df.empty:
+    if df is None or df.empty:
         for i in range(1, len(hierarchy) + 1):
-            out[i] = pd.Series(dtype=float)
-        return out
+            value_dicts[i] = {}
+            children_map[i] = {}
+        return value_dicts, children_map
+
+    clean = df.dropna(subset=hierarchy)
+    if clean.empty:
+        for i in range(1, len(hierarchy) + 1):
+            value_dicts[i] = {}
+            children_map[i] = {}
+        return value_dicts, children_map
+
+    deep = clean.groupby(hierarchy, observed=True)[value_col].agg(["sum", "count"])
+
     for i in range(1, len(hierarchy) + 1):
         cols = hierarchy[:i]
-        clean = df.dropna(subset=cols)
-        if clean.empty:
-            out[i] = pd.Series(dtype=float)
-            continue
-        s = clean.groupby(cols, observed=True)[value_col].mean()
+        if i == len(hierarchy):
+            rolled = deep
+        else:
+            rolled = deep.groupby(level=cols, observed=True).sum()
+
+        with np.errstate(divide="ignore", invalid="ignore"):
+            s = rolled["sum"] / rolled["count"]
         if multiplier != 1.0:
             s = s * multiplier
-        out[i] = s
-    return out
+        value_dicts[i] = s.to_dict()
+
+        if i >= 2:
+            cmap: dict = {}
+            for key, val in s.items():
+                if not isinstance(key, tuple):
+                    continue
+                parent = key[0] if i == 2 else key[:-1]
+                child = key[-1]
+                cmap.setdefault(parent, []).append((child, float(val)))
+            for k in cmap:
+                cmap[k].sort(key=lambda x: x[1], reverse=True)
+            children_map[i] = cmap
+        else:
+            children_map[i] = {}
+
+    return value_dicts, children_map
+
+def _safe_get(d: dict, key) -> float:
+    v = d.get(key)
+    if v is None:
+        return float("nan")
+    return float(v)
 
 
 # ===========================================================================
 # TAB 2 — PRICING
 # ===========================================================================
-with tab_pricing:
+if active_tab == "💲 Pricing":
+    _mark("tab_pricing START")
     if price_df is None or price_df.empty:
         if _dd_load_error:
             st.error(f"Failed to load pricing data: {_dd_load_error}")
@@ -1285,7 +1430,6 @@ with tab_pricing:
             unsafe_allow_html=True,
         )
 
-        # Filters
         pr_c1, pr_c2, pr_c3, pr_c4, pr_c5, pr_c6 = st.columns([1, 1, 1, 1, 1.2, 1.2])
         with pr_c1:
             pr_platforms = ["All"] + sorted(price_df["Platform"].dropna().astype(str).unique().tolist())
@@ -1298,32 +1442,46 @@ with tab_pricing:
             pr_f_cat = st.selectbox("Category", pr_cats, index=0, key="pr_cat")
         with pr_c4:
             pr_f_type = st.selectbox("Type", ["All", "Brand", "Competitor"], index=0, key="pr_type")
+
         with pr_c5:
-            pr_min_date = price_df["Date"].min().date() if price_df["Date"].notna().any() else date.today()
-            pr_max_date = price_df["Date"].max().date() if price_df["Date"].notna().any() else date.today()
-            pr_date_from = st.date_input("Date from", value=pr_min_date,
+            # Allow picking any date in the current year, regardless of what's in the data.
+            pr_data_max = price_df["Date"].max().date() if price_df["Date"].notna().any() else date.today()
+            pr_min_date = date(pr_data_max.year, 1, 1)  # Jan 1 of current year
+            pr_max_date = pr_data_max  # latest date in data
+            pr_default_from = pr_max_date.replace(day=1)  # 1st of current month
+            pr_date_from = st.date_input("Date from", value=pr_default_from,
                                          min_value=pr_min_date, max_value=pr_max_date, key="pr_dfrom")
         with pr_c6:
             pr_date_to = st.date_input("Date to", value=pr_max_date,
                                        min_value=pr_min_date, max_value=pr_max_date, key="pr_dto")
 
+        # Default comparison period = the month before pr_default_from
+        _prev_month_end = pr_default_from - timedelta(days=1)
+        _prev_month_start = _prev_month_end.replace(day=1)
+        # Clamp into selectable range
+        _prev_month_start = max(_prev_month_start, pr_min_date)
+        _prev_month_end = max(_prev_month_end, pr_min_date)
+
         pr_c7, pr_c8 = st.columns(2)
         with pr_c7:
-            pr_comp_from = st.date_input("Compare from", value=pr_min_date, key="pr_cfrom")
+            pr_comp_from = st.date_input("Compare from", value=_prev_month_start,
+                                         min_value=pr_min_date, max_value=pr_max_date, key="pr_cfrom")
         with pr_c8:
-            pr_comp_to = st.date_input("Compare to", value=pr_max_date, key="pr_cto")
+            pr_comp_to = st.date_input("Compare to", value=_prev_month_end,
+                                       min_value=pr_min_date, max_value=pr_max_date, key="pr_cto")
 
-        # Build masks vectorized — once each for main + comp
-        pdates = price_df["Date"].dt.date
-        pbase_mask = pd.Series(True, index=price_df.index)
-        if pr_f_plat != "All":  pbase_mask &= price_df["Platform"].astype(str) == pr_f_plat
-        if pr_f_brand != "All": pbase_mask &= price_df["Brand"].astype(str) == pr_f_brand
-        if pr_f_cat != "All":   pbase_mask &= price_df["Category"].astype(str) == pr_f_cat
-        if pr_f_type != "All" and "Type" in price_df.columns:
-            pbase_mask &= price_df["Type"].astype(str) == pr_f_type
 
-        pf_main = price_df[pbase_mask & (pdates >= pr_date_from) & (pdates <= pr_date_to)]
-        pf_comp = price_df[pbase_mask & (pdates >= pr_comp_from) & (pdates <= pr_comp_to)]
+        # Static filters cached once. Date slicing is then a fast O(log n) cut.
+        _pr_indexed = _filter_and_index_pricing(
+            price_df, id(price_df),
+            pr_f_plat, pr_f_brand, pr_f_cat, pr_f_type,
+        )
+        pf_main = _slice_by_date(_pr_indexed, pr_date_from, pr_date_to)
+        pf_comp = _slice_by_date(_pr_indexed, pr_comp_from, pr_comp_to)
+
+        _empty = price_df.iloc[0:0]
+        if pf_main is None: pf_main = _empty
+        if pf_comp is None: pf_comp = _empty
 
         if pf_main.empty:
             st.info("No pricing data for the selected filters.")
@@ -1331,8 +1489,8 @@ with tab_pricing:
             has_sku = "SKU" in pf_main.columns and pf_main["SKU"].notna().any()
             hierarchy = ["Platform", "Brand", "Category"] + (["SKU"] if has_sku else [])
 
-            main_levels = _hier_means(pf_main, hierarchy, "Price")
-            comp_levels = _hier_means(pf_comp, hierarchy, "Price")
+            main_vals, main_kids = _hier_aggregate(pf_main, hierarchy, "Price")
+            comp_vals, _ = _hier_aggregate(pf_comp, hierarchy, "Price")
 
             def fmt_change(curr, prev):
                 if pd.isna(curr) or pd.isna(prev):
@@ -1352,7 +1510,6 @@ with tab_pricing:
                 s = str(s)
                 return s.split(" PC: Z")[0] if " PC: Z" in s else s
 
-            # Build the HTML tree as a single string ------------------------------
             parts = ["<div class='drill-tree cols-3'>"]
             parts.append(
                 "<div class='row header'>"
@@ -1362,24 +1519,15 @@ with tab_pricing:
                 "</div>"
             )
 
-            plat_series = main_levels[1].sort_values(ascending=False)
-            for plat in plat_series.index:
-                plat_v = float(plat_series[plat])
-                plat_c = _get_loc(comp_levels[1], plat)
+            plats_sorted = sorted(main_vals[1].items(), key=lambda kv: kv[1], reverse=True)
+
+            for plat, plat_v in plats_sorted:
+                plat_v = float(plat_v)
+                plat_c = _safe_get(comp_vals[1], plat)
                 plat_label = _esc(plat)
 
-                # Brands under this platform
-                if 2 in main_levels and not main_levels[2].empty:
-                    try:
-                        brand_series = main_levels[2].loc[plat]
-                        if isinstance(brand_series, float):  # singleton edge case
-                            brand_series = pd.Series(dtype=float)
-                    except KeyError:
-                        brand_series = pd.Series(dtype=float)
-                else:
-                    brand_series = pd.Series(dtype=float)
-
-                if brand_series.empty:
+                brand_kids = main_kids.get(2, {}).get(plat, [])
+                if not brand_kids:
                     parts.append(
                         f"<div class='row level-0'>"
                         f"<span><span class='caret-empty'></span> "
@@ -1395,22 +1543,12 @@ with tab_pricing:
                     f"{cells(plat_v, plat_c)}</div></summary>"
                 )
 
-                for brand in brand_series.sort_values(ascending=False).index:
-                    brand_v = float(brand_series[brand])
-                    brand_c = _get_loc(comp_levels[2], (plat, brand))
+                for brand, brand_v in brand_kids:
+                    brand_c = _safe_get(comp_vals[2], (plat, brand))
                     brand_label = _esc(brand)
 
-                    if 3 in main_levels and not main_levels[3].empty:
-                        try:
-                            cat_series = main_levels[3].loc[(plat, brand)]
-                            if isinstance(cat_series, float):
-                                cat_series = pd.Series(dtype=float)
-                        except KeyError:
-                            cat_series = pd.Series(dtype=float)
-                    else:
-                        cat_series = pd.Series(dtype=float)
-
-                    if cat_series.empty:
+                    cat_kids = main_kids.get(3, {}).get((plat, brand), [])
+                    if not cat_kids:
                         parts.append(
                             f"<div class='row level-1'>"
                             f"<span><span class='caret-empty'></span> "
@@ -1426,22 +1564,12 @@ with tab_pricing:
                         f"{cells(brand_v, brand_c)}</div></summary>"
                     )
 
-                    for cat in cat_series.sort_values(ascending=False).index:
-                        cat_v = float(cat_series[cat])
-                        cat_c = _get_loc(comp_levels[3], (plat, brand, cat))
+                    for cat, cat_v in cat_kids:
+                        cat_c = _safe_get(comp_vals[3], (plat, brand, cat))
                         cat_label = _esc(cat)
 
-                        if has_sku and 4 in main_levels and not main_levels[4].empty:
-                            try:
-                                sku_series = main_levels[4].loc[(plat, brand, cat)]
-                                if isinstance(sku_series, float):
-                                    sku_series = pd.Series(dtype=float)
-                            except KeyError:
-                                sku_series = pd.Series(dtype=float)
-                        else:
-                            sku_series = pd.Series(dtype=float)
-
-                        if sku_series.empty:
+                        sku_kids = main_kids.get(4, {}).get((plat, brand, cat), []) if has_sku else []
+                        if not sku_kids:
                             parts.append(
                                 f"<div class='row level-2'>"
                                 f"<span><span class='caret-empty'></span> "
@@ -1457,9 +1585,8 @@ with tab_pricing:
                             f"{cells(cat_v, cat_c)}</div></summary>"
                         )
 
-                        for sku in sku_series.sort_values(ascending=False).index:
-                            sku_v = float(sku_series[sku])
-                            sku_c = _get_loc(comp_levels[4], (plat, brand, cat, sku))
+                        for sku, sku_v in sku_kids:
+                            sku_c = _safe_get(comp_vals[4], (plat, brand, cat, sku))
                             sku_label = _esc(_strip_pcz(sku))
                             parts.append(
                                 f"<div class='row level-3'>"
@@ -1472,8 +1599,14 @@ with tab_pricing:
                 parts.append("</details>")
 
             # Total
-            total_main = float(plat_series.mean()) if not plat_series.empty else float("nan")
-            total_comp = float(comp_levels[1].mean()) if not comp_levels[1].empty else float("nan")
+            if main_vals[1]:
+                total_main = sum(main_vals[1].values()) / len(main_vals[1])
+            else:
+                total_main = float("nan")
+            if comp_vals[1]:
+                total_comp = sum(comp_vals[1].values()) / len(comp_vals[1])
+            else:
+                total_comp = float("nan")
             parts.append(
                 f"<div class='row total level-0'>"
                 f"<span><span class='caret-empty'></span> "
@@ -1483,11 +1616,77 @@ with tab_pricing:
             parts.append("</div>")
             st.markdown("".join(parts), unsafe_allow_html=True)
 
+            # -------- Trendline: main vs comparison range --------
+            st.markdown("<div class='sec-title' style='margin-top:24px;'>"
+                        "Price trend — main vs comparison</div>",
+                        unsafe_allow_html=True)
+            st.markdown("<div class='sec-sub'>Daily average price across the current "
+                        "filter selection. Lines are aligned on day-in-range so trend "
+                        "shapes can be compared directly.</div>",
+                        unsafe_allow_html=True)
+
+
+            def _daily_avg_with_offset(frame, range_start):
+                """Daily mean price + 1-indexed day offset within the range."""
+                if frame is None or frame.empty:
+                    return pd.DataFrame(columns=["day_offset", "date", "price"])
+                daily = frame.groupby(level=0)["Price"].mean().sort_index()
+                out = pd.DataFrame({
+                    "date": pd.to_datetime(daily.index),
+                    "price": daily.values,
+                })
+                out["day_offset"] = (out["date"] - pd.Timestamp(range_start)).dt.days + 1
+                return out
+
+
+            main_line = _daily_avg_with_offset(pf_main, pr_date_from)
+            comp_line = _daily_avg_with_offset(pf_comp, pr_comp_from)
+
+            if main_line.empty and comp_line.empty:
+                st.info("No daily price observations in either range to plot.")
+            else:
+                fig = go.Figure()
+
+                if not main_line.empty:
+                    fig.add_trace(go.Scatter(
+                        x=main_line["day_offset"], y=main_line["price"],
+                        mode="lines+markers",
+                        name=f"Main ({pr_date_from:%d %b} – {pr_date_to:%d %b})",
+                        line=dict(color=NAVY, width=2.5),
+                        marker=dict(size=7),
+                        customdata=main_line["date"].dt.strftime("%d %b %Y"),
+                        hovertemplate="<b>%{customdata}</b><br>"
+                                      "Day %{x} · SAR %{y:.2f}<extra></extra>",
+                    ))
+
+                if not comp_line.empty:
+                    fig.add_trace(go.Scatter(
+                        x=comp_line["day_offset"], y=comp_line["price"],
+                        mode="lines+markers",
+                        name=f"Comparison ({pr_comp_from:%d %b} – {pr_comp_to:%d %b})",
+                        line=dict(color=SAUDIA_BLUE, width=2.5, dash="dash"),
+                        marker=dict(size=7),
+                        customdata=comp_line["date"].dt.strftime("%d %b %Y"),
+                        hovertemplate="<b>%{customdata}</b><br>"
+                                      "Day %{x} · SAR %{y:.2f}<extra></extra>",
+                    ))
+
+                fig.update_layout(
+                    height=380, margin=dict(l=10, r=10, t=10, b=10),
+                    plot_bgcolor="white",
+                    yaxis=dict(gridcolor="#e5e7eb", title="Average price (SAR)"),
+                    xaxis=dict(title="Day in range", gridcolor="#e5e7eb"),
+                    legend=dict(orientation="h", yanchor="bottom",
+                                y=1.02, xanchor="right", x=1),
+                )
+                st.plotly_chart(fig, use_container_width=True)
+        _mark("tab_pricing END")
 
 # ===========================================================================
 # TAB 3 — AVAILABILITY
 # ===========================================================================
-with tab_availability:
+if active_tab == "📦 Availability":
+    _mark("tab_availability START")
     if avail_df is None or avail_df.empty:
         if _dd_load_error:
             st.error(f"Failed to load availability data: {_dd_load_error}")
@@ -1513,35 +1712,39 @@ with tab_availability:
         with av_c4:
             av_brands = ["All"] + sorted(avail_df["Brand"].dropna().astype(str).unique().tolist())
             av_f_brand = st.selectbox("Brand", av_brands, index=0, key="av_brand")
+
         with av_c5:
-            av_min_date = avail_df["Date"].min().date() if avail_df["Date"].notna().any() else date.today()
-            av_max_date = avail_df["Date"].max().date() if avail_df["Date"].notna().any() else date.today()
-            av_date_from = st.date_input("Date from", value=av_min_date,
+            av_data_max = avail_df["Date"].max().date() if avail_df["Date"].notna().any() else date.today()
+            av_min_date = date(av_data_max.year, 1, 1)  # Jan 1 of current year
+            av_max_date = av_data_max  # latest date in data
+            av_default_from = av_max_date.replace(day=1)  # 1st of current month
+            av_date_from = st.date_input("Date from", value=av_default_from,
                                          min_value=av_min_date, max_value=av_max_date, key="av_dfrom")
         with av_c6:
             av_date_to = st.date_input("Date to", value=av_max_date,
                                        min_value=av_min_date, max_value=av_max_date, key="av_dto")
 
-        # Build base mask vectorized
-        avdates = avail_df["Date"].dt.date
-        avbase_mask = pd.Series(True, index=avail_df.index)
-        if av_f_plat != "All":  avbase_mask &= avail_df["Platform"].astype(str) == av_f_plat
-        if av_f_store != "All": avbase_mask &= avail_df["Store"].astype(str) == av_f_store
-        if av_f_cat != "All":   avbase_mask &= avail_df["Category"].astype(str) == av_f_cat
-        if av_f_brand != "All": avbase_mask &= avail_df["Brand"].astype(str) == av_f_brand
-
-        # Auto-derived periods (computed ONCE)
+        # Auto-derived periods
         range_days = (av_date_to - av_date_from).days + 1
         comp_from = av_date_from - timedelta(days=range_days)
         comp_to = av_date_from - timedelta(days=1)
         mtd_start = av_date_to.replace(day=1)
         ytd_start = av_date_to.replace(month=1, day=1)
 
-        af_main = avail_df[avbase_mask & (avdates >= av_date_from) & (avdates <= av_date_to)]
-        af_comp = avail_df[avbase_mask & (avdates >= comp_from)    & (avdates <= comp_to)]
-        af_mtd  = avail_df[avbase_mask & (avdates >= mtd_start)    & (avdates <= av_date_to)]
-        af_ytd  = avail_df[avbase_mask & (avdates >= ytd_start)    & (avdates <= av_date_to)]
+        _av_indexed = _filter_and_index_availability(
+            avail_df, id(avail_df),
+            av_f_plat, av_f_store, av_f_cat, av_f_brand,
+        )
+        af_main = _slice_by_date(_av_indexed, av_date_from, av_date_to)
+        af_comp = _slice_by_date(_av_indexed, comp_from, comp_to)
+        af_mtd = _slice_by_date(_av_indexed, mtd_start, av_date_to)
+        af_ytd = _slice_by_date(_av_indexed, ytd_start, av_date_to)
 
+        _empty = avail_df.iloc[0:0]
+        if af_main is None: af_main = _empty
+        if af_comp is None: af_comp = _empty
+        if af_mtd is None: af_mtd = _empty
+        if af_ytd is None: af_ytd = _empty
         if af_main.empty:
             st.info("No availability data for the selected filters.")
         else:
@@ -1561,11 +1764,10 @@ with tab_availability:
                          + (["SKU"] if has_sku else [])
                          + (["Store"] if has_store else []))
 
-            # ----- single-pass aggregates per period, per level -----
-            main_lv = _hier_means(af_main, hierarchy, "Availability", multiplier=100.0)
-            comp_lv = _hier_means(af_comp, hierarchy, "Availability", multiplier=100.0)
-            mtd_lv  = _hier_means(af_mtd,  hierarchy, "Availability", multiplier=100.0)
-            ytd_lv  = _hier_means(af_ytd,  hierarchy, "Availability", multiplier=100.0)
+            main_vals, main_kids = _hier_aggregate(af_main, hierarchy, "Availability", multiplier=100.0)
+            comp_vals, _ = _hier_aggregate(af_comp, hierarchy, "Availability", multiplier=100.0)
+            mtd_vals,  _ = _hier_aggregate(af_mtd,  hierarchy, "Availability", multiplier=100.0)
+            ytd_vals,  _ = _hier_aggregate(af_ytd,  hierarchy, "Availability", multiplier=100.0)
 
             def fmt_avail_pct(v):
                 if pd.isna(v): return "<span style='color:#9ca3af'>—</span>"
@@ -1583,10 +1785,10 @@ with tab_availability:
                 return f"<span style='color:{MUTED}'>0%</span>"
 
             def cells4(level, key):
-                m = _get_loc(main_lv[level], key)
-                c = _get_loc(comp_lv[level], key) if level in comp_lv else float("nan")
-                mt = _get_loc(mtd_lv[level], key) if level in mtd_lv else float("nan")
-                yt = _get_loc(ytd_lv[level], key) if level in ytd_lv else float("nan")
+                m = _safe_get(main_vals.get(level, {}), key)
+                c = _safe_get(comp_vals.get(level, {}), key)
+                mt = _safe_get(mtd_vals.get(level, {}), key)
+                yt = _safe_get(ytd_vals.get(level, {}), key)
                 return (f"<span class='num'>{fmt_avail_pct(m)}</span>"
                         f"<span class='num'>{fmt_vs(m, c)}</span>"
                         f"<span class='num'>{fmt_avail_pct(mt)}</span>"
@@ -1599,7 +1801,6 @@ with tab_availability:
                 s = str(s)
                 return _esc(s.split(" PC: Z")[0] if " PC: Z" in s else s)
 
-            # ----- build tree -----
             parts = ["<div class='drill-tree cols-5'>"]
             parts.append(
                 "<div class='row header'>"
@@ -1611,24 +1812,14 @@ with tab_availability:
                 "</div>"
             )
 
-            plat_series = main_lv[1].sort_values(ascending=False) if not main_lv[1].empty else pd.Series(dtype=float)
-
+            plats_sorted = sorted(main_vals[1].items(), key=lambda kv: kv[1], reverse=True)
             n_levels = len(hierarchy)
-            # Hierarchy when fully populated:
-            #   1=Platform, 2=Category, 3=Brand, 4=SKU, 5=Store
-            for plat in plat_series.index:
-                plat_label = _esc(plat)
-                # Categories under platform
-                cat_series = pd.Series(dtype=float)
-                if n_levels >= 2 and not main_lv[2].empty:
-                    try:
-                        cat_series = main_lv[2].loc[plat]
-                        if isinstance(cat_series, float):
-                            cat_series = pd.Series(dtype=float)
-                    except KeyError:
-                        pass
 
-                if cat_series.empty:
+            for plat, _v in plats_sorted:
+                plat_label = _esc(plat)
+                cat_kids = main_kids.get(2, {}).get(plat, []) if n_levels >= 2 else []
+
+                if not cat_kids:
                     parts.append(
                         f"<div class='row level-0'>"
                         f"<span><span class='caret-empty'></span> "
@@ -1644,19 +1835,11 @@ with tab_availability:
                     f"{cells4(1, plat)}</div></summary>"
                 )
 
-                for cat in cat_series.sort_values(ascending=False).index:
+                for cat, _ in cat_kids:
                     cat_label = _esc(cat)
-                    # Brands under this category
-                    brand_series = pd.Series(dtype=float)
-                    if has_brand and n_levels >= 3 and not main_lv[3].empty:
-                        try:
-                            brand_series = main_lv[3].loc[(plat, cat)]
-                            if isinstance(brand_series, float):
-                                brand_series = pd.Series(dtype=float)
-                        except KeyError:
-                            pass
+                    brand_kids = main_kids.get(3, {}).get((plat, cat), []) if (has_brand and n_levels >= 3) else []
 
-                    if brand_series.empty:
+                    if not brand_kids:
                         parts.append(
                             f"<div class='row level-1'>"
                             f"<span><span class='caret-empty'></span> "
@@ -1672,19 +1855,11 @@ with tab_availability:
                         f"{cells4(2, (plat, cat))}</div></summary>"
                     )
 
-                    for brand in brand_series.sort_values(ascending=False).index:
+                    for brand, _ in brand_kids:
                         brand_label = _esc(brand)
-                        # SKUs under this brand
-                        sku_series = pd.Series(dtype=float)
-                        if has_sku and n_levels >= 4 and not main_lv[4].empty:
-                            try:
-                                sku_series = main_lv[4].loc[(plat, cat, brand)]
-                                if isinstance(sku_series, float):
-                                    sku_series = pd.Series(dtype=float)
-                            except KeyError:
-                                pass
+                        sku_kids = main_kids.get(4, {}).get((plat, cat, brand), []) if (has_sku and n_levels >= 4) else []
 
-                        if sku_series.empty:
+                        if not sku_kids:
                             parts.append(
                                 f"<div class='row level-2'>"
                                 f"<span><span class='caret-empty'></span> "
@@ -1700,19 +1875,11 @@ with tab_availability:
                             f"{cells4(3, (plat, cat, brand))}</div></summary>"
                         )
 
-                        for sku in sku_series.sort_values(ascending=False).index:
+                        for sku, _ in sku_kids:
                             sku_label = _strip_pcz(sku)
-                            # Stores under this SKU
-                            store_series = pd.Series(dtype=float)
-                            if has_store and n_levels >= 5 and not main_lv[5].empty:
-                                try:
-                                    store_series = main_lv[5].loc[(plat, cat, brand, sku)]
-                                    if isinstance(store_series, float):
-                                        store_series = pd.Series(dtype=float)
-                                except KeyError:
-                                    pass
+                            store_kids = main_kids.get(5, {}).get((plat, cat, brand, sku), []) if (has_store and n_levels >= 5) else []
 
-                            if store_series.empty:
+                            if not store_kids:
                                 parts.append(
                                     f"<div class='row level-3'>"
                                     f"<span><span class='caret-empty'></span> "
@@ -1728,7 +1895,7 @@ with tab_availability:
                                 f"{cells4(4, (plat, cat, brand, sku))}</div></summary>"
                             )
 
-                            for store in store_series.sort_values(ascending=False).index:
+                            for store, _ in store_kids:
                                 parts.append(
                                     f"<div class='row level-4'>"
                                     f"<span><span class='caret-empty'></span> "
@@ -1741,11 +1908,11 @@ with tab_availability:
                 parts.append("</details>")
 
             # Total
-            if not plat_series.empty:
-                ta = float(plat_series.mean())
-                tc = float(comp_lv[1].mean()) if not comp_lv[1].empty else float("nan")
-                tm = float(mtd_lv[1].mean()) if not mtd_lv[1].empty else float("nan")
-                ty = float(ytd_lv[1].mean()) if not ytd_lv[1].empty else float("nan")
+            if main_vals[1]:
+                ta = sum(main_vals[1].values()) / len(main_vals[1])
+                tc = (sum(comp_vals[1].values()) / len(comp_vals[1])) if comp_vals[1] else float("nan")
+                tm = (sum(mtd_vals[1].values())  / len(mtd_vals[1]))  if mtd_vals[1]  else float("nan")
+                ty = (sum(ytd_vals[1].values())  / len(ytd_vals[1]))  if ytd_vals[1]  else float("nan")
                 parts.append(
                     f"<div class='row total level-0'>"
                     f"<span><span class='caret-empty'></span> "
@@ -1762,13 +1929,14 @@ with tab_availability:
             # Platform bar chart
             st.markdown("<div class='sec-title' style='margin-top:24px;'>Availability by Platform</div>",
                         unsafe_allow_html=True)
-            plat_avail = main_lv[1].round(1)
-            if not plat_avail.empty:
-                names = plat_avail.index.astype(str).tolist()
+            if main_vals[1]:
+                items = sorted(main_vals[1].items(), key=lambda kv: kv[1], reverse=True)
+                names = [str(k) for k, _ in items]
+                values = [round(v, 1) for _, v in items]
                 fig = go.Figure(go.Bar(
-                    x=names, y=plat_avail.values,
+                    x=names, y=values,
                     marker_color=[PLATFORM_COLORS.get(p, "#9CA3AF") for p in names],
-                    text=[f"{v:.0f}%" for v in plat_avail.values],
+                    text=[f"{v:.0f}%" for v in values],
                     textposition="outside",
                 ))
                 fig.update_layout(height=340, margin=dict(l=10, r=10, t=10, b=10),
@@ -1776,3 +1944,7 @@ with tab_availability:
                                   yaxis=dict(gridcolor="#e5e7eb", title="Availability %", range=[0, 105]),
                                   xaxis=dict(title=""))
                 st.plotly_chart(fig, use_container_width=True)
+    _mark("tab_availability END")
+
+_mark("END")
+st.sidebar.write(f"Total rerun time: {(time.perf_counter() - _SCRIPT_START)*1000:.0f}ms")
