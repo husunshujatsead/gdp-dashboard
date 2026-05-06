@@ -323,7 +323,7 @@ def _fix_dates_column(series: pd.Series) -> pd.Series:
 # ---------------------------------------------------------------------------
 # CACHED LOADERS  (calamine engine throughout for ~5-10x faster Excel reads)
 # ---------------------------------------------------------------------------
-@st.cache_data(show_spinner="Loading historic file…")
+@st.cache_resource(show_spinner="Loading historic file…")
 def _load_historic_cached(_key, path_or_buffer) -> pd.DataFrame:
     xl = pd.ExcelFile(path_or_buffer, engine="calamine")
     sheet = xl.sheet_names[0]
@@ -361,7 +361,7 @@ def load_historic(path_or_buffer):
     return _load_historic_cached(_path_cache_key(path_or_buffer), path_or_buffer)
 
 
-@st.cache_data(show_spinner="Loading MTD file…")
+@st.cache_resource(show_spinner="Loading MTD file…")
 def _load_mtd_cached(_key, path_or_buffer) -> pd.DataFrame:
     df = pd.read_excel(path_or_buffer, sheet_name="Data", engine="calamine")
     df.columns = [c.strip() for c in df.columns]
@@ -389,7 +389,7 @@ def load_mtd(path_or_buffer):
     return _load_mtd_cached(_path_cache_key(path_or_buffer), path_or_buffer)
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_resource(show_spinner=False)
 def merge_historic_mtd(hist: pd.DataFrame, mtd: pd.DataFrame) -> pd.DataFrame:
     mtd_periods = mtd[["Year", "MonthNum"]].drop_duplicates()
     mtd_keys = set(zip(mtd_periods["Year"].astype(int),
@@ -402,7 +402,7 @@ def merge_historic_mtd(hist: pd.DataFrame, mtd: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---- mfilterit pricing & availability — combined + cached ------------------
-@st.cache_data(show_spinner="Loading pricing & availability data…")
+@st.cache_resource(show_spinner="Loading pricing & availability data…")
 def _load_mfilterit_cached(_pricing_key, _avail_key,
                            pricing_paths: list, availability_path: str):
     OWN_BRANDS = ["Saudia", "Crispy"]
@@ -492,7 +492,7 @@ def load_mfilterit_data(availability_path):
 
 
 # ---- Keeta + Ninja loaders ------------------------------------------------
-@st.cache_data(show_spinner="Loading Keeta tracker…")
+@st.cache_resource(show_spinner="Loading Keeta tracker…")
 def _load_keeta_cached(_key, path_or_buffer):
     xl = pd.ExcelFile(path_or_buffer, engine="calamine")
     loc_raw = pd.read_excel(xl, sheet_name="Locations Key", header=None)
@@ -570,7 +570,7 @@ def load_keeta_tracker(path_or_buffer):
     return _load_keeta_cached(_path_cache_key(path_or_buffer), path_or_buffer)
 
 
-@st.cache_data(show_spinner="Loading Ninja tracker…")
+@st.cache_resource(show_spinner="Loading Ninja tracker…")
 def _load_ninja_cached(_key, path_or_buffer):
     xl = pd.ExcelFile(path_or_buffer, engine="calamine")
     rows = []
@@ -631,7 +631,7 @@ def load_ninja_tracker(path_or_buffer):
     return _load_ninja_cached(_path_cache_key(path_or_buffer), path_or_buffer)
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_resource(show_spinner=False)
 def _build_combined_price(_pkey, _kkey, _nkey, base_price, keeta_price, ninja_price):
     parts = []
     if base_price is not None and not base_price.empty:
@@ -658,7 +658,7 @@ def _build_combined_price(_pkey, _kkey, _nkey, base_price, keeta_price, ninja_pr
     return out
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_resource(show_spinner=False)
 def _build_combined_avail(_pkey, _kkey, _nkey, base_avail, keeta_avail, ninja_avail):
     parts = []
     if base_avail is not None and not base_avail.empty:
@@ -683,7 +683,7 @@ def _build_combined_avail(_pkey, _kkey, _nkey, base_avail, keeta_avail, ninja_av
     return out
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_resource(show_spinner=False)
 def _filter_and_index_pricing(
     _price_df: pd.DataFrame,
     cache_token,
@@ -703,7 +703,7 @@ def _filter_and_index_pricing(
     return f.sort_values("Date").set_index("Date")
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_resource(show_spinner=False)
 def _filter_and_index_availability(
     _avail_df: pd.DataFrame,
     cache_token,
@@ -729,7 +729,7 @@ def _slice_by_date(indexed_df, d_from, d_to):
     hi = pd.Timestamp(d_to) + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
     return indexed_df.loc[lo:hi]
 
-@st.cache_data(show_spinner=False, max_entries=32)
+@st.cache_resource(show_spinner=False, max_entries=32)
 def _build_pricing_drill_html(
     cache_token,
     plat: str, brand: str, cat: str, typ: str,
@@ -827,7 +827,7 @@ def _build_pricing_drill_html(
     return "".join(parts)
 
 
-@st.cache_data(show_spinner=False, max_entries=32)
+@st.cache_resource(show_spinner=False, max_entries=32)
 def _build_pricing_trend_fig(
     cache_token,
     plat: str, brand: str, cat: str, typ: str,
@@ -908,7 +908,7 @@ def _build_pricing_trend_fig(
     )
     return fig
 
-@st.cache_data(show_spinner=False, max_entries=32)
+@st.cache_resource(show_spinner=False, max_entries=32)
 def _build_pricing_platform_trend_fig(
         cache_token,
         plat: str, brand: str, cat: str, typ: str,
@@ -1006,7 +1006,7 @@ def _build_pricing_platform_trend_fig(
 # Cached AVAILABILITY builders (drill HTML + bar chart)
 # Same pattern as the pricing builders above.
 # ---------------------------------------------------------------------------
-@st.cache_data(show_spinner=False, max_entries=32)
+@st.cache_resource(show_spinner=False, max_entries=32)
 def _build_availability_drill_html(
     cache_token,
     plat: str, store: str, cat: str, brand: str,
@@ -1200,7 +1200,7 @@ def _build_availability_drill_html(
     return overall_avail, "".join(parts)
 
 
-@st.cache_data(show_spinner=False, max_entries=32)
+@st.cache_resource(show_spinner=False, max_entries=32)
 def _build_availability_bar_fig(
     cache_token,
     plat: str, store: str, cat: str, brand: str,
