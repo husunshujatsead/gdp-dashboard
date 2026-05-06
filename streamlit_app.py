@@ -909,6 +909,64 @@ def _build_pricing_trend_fig(
     return fig
 
 
+
+@st.cache_resource(show_spinner=False, max_entries=32)
+def _build_pricing_platform_trend_fig(
+    cache_token,
+    plat: str, brand: str, cat: str, typ: str,
+    d_from: date, d_to: date,
+):
+    """Average price per day, one line per platform."""
+    indexed = _filter_and_index_pricing(price_df, cache_token, plat, brand, cat, typ)
+    main_local = _slice_by_date(indexed, d_from, d_to)
+
+    if main_local is None or main_local.empty or "Platform" not in main_local.columns:
+        return None
+
+    # Daily mean price per platform
+    daily = (main_local.reset_index()
+                       .groupby(["Date", "Platform"], observed=True)["Price"]
+                       .mean()
+                       .reset_index())
+    daily["Date"] = pd.to_datetime(daily["Date"])
+    daily["Platform"] = daily["Platform"].astype(str)
+
+    platforms = sorted(daily["Platform"].unique())
+    if not platforms:
+        return None
+
+    fig = go.Figure()
+    for plat_name in platforms:
+        pdata = daily[daily["Platform"] == plat_name].sort_values("Date")
+        fig.add_trace(go.Scatter(
+            x=pdata["Date"],
+            y=pdata["Price"],
+            mode="lines+markers",
+            name=plat_name,
+            line=dict(color=PLATFORM_COLORS.get(plat_name, "#9CA3AF"), width=2),
+            marker=dict(size=6),
+            hovertemplate=(
+                f"<b>{plat_name}</b><br>"
+                "%{x|%d %b %Y}<br>"
+                "SAR %{y:.2f}<extra></extra>"
+            ),
+        ))
+
+    fig.update_layout(
+        height=400,
+        margin=dict(l=10, r=10, t=10, b=10),
+        plot_bgcolor="white",
+        yaxis=dict(gridcolor="#e5e7eb", title="Average price (SAR)"),
+        xaxis=dict(gridcolor="#e5e7eb", title=""),
+        legend=dict(
+            orientation="h", yanchor="bottom",
+            y=1.02, xanchor="right", x=1,
+            title_text="Platform",
+        ),
+    )
+    return fig
+
+
 # ---------------------------------------------------------------------------
 # Cached AVAILABILITY builders (drill HTML + bar chart)
 # Same pattern as the pricing builders above.
@@ -1932,7 +1990,21 @@ if active_tab == "💲 Pricing":
             if trend_fig is None:
                 st.info("No daily price observations in either range to plot.")
             else:
-                st.plotly_chart(trend_fig, use_container_width=True)
+                # st.plotly_chart(trend_fig, use_container_width=True)
+                #
+                # st.markdown("<div class='sec-title' style='margin-top:24px;'>"
+                #             "Price trend by platform</div>",
+                #             unsafe_allow_html=True)
+
+                platform_trend_fig = _build_pricing_platform_trend_fig(
+                    id(price_df),
+                    pr_f_plat, pr_f_brand, pr_f_cat, pr_f_type,
+                    pr_date_from, pr_date_to,
+                )
+                if platform_trend_fig is None:
+                    st.info("No daily price observations to plot by platform.")
+                else:
+                    st.plotly_chart(platform_trend_fig, use_container_width=True)
 # ===========================================================================
 # TAB 3 — AVAILABILITY
 # ===========================================================================
