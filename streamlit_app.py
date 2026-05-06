@@ -404,7 +404,7 @@ def merge_historic_mtd(hist: pd.DataFrame, mtd: pd.DataFrame) -> pd.DataFrame:
 # ---- mfilterit pricing & availability — combined + cached ------------------
 @st.cache_resource(show_spinner="Loading pricing & availability data…")
 def _load_mfilterit_cached(_pricing_key, _avail_key,
-                           pricing_path: str, availability_path: str):
+                           pricing_paths: list, availability_path: str):
     OWN_BRANDS = ["Saudia", "Crispy"]
     TRACKED_COMPETITORS = ["Almarai", "Nadec"]
     PLATFORM_MAP_MF = {
@@ -448,8 +448,15 @@ def _load_mfilterit_cached(_pricing_key, _avail_key,
     # 2. PRICE
     PRICE_USECOLS = ["inserted_date", "platform", "oem_code", "product_code",
                      "brand", "brand_type", "sub_category", "title_local", "mrp"]
-    pricing = pd.read_excel(pricing_path, sheet_name="Base data",
-                            usecols=PRICE_USECOLS, engine="calamine")
+    pricing_parts = []
+    for p in pricing_paths:
+        try:
+            part = pd.read_excel(p, sheet_name="Base data",
+                                 usecols=PRICE_USECOLS, engine="calamine")
+            pricing_parts.append(part)
+        except Exception:
+            pass
+    pricing = pd.concat(pricing_parts, ignore_index=True) if pricing_parts else pd.DataFrame(columns=PRICE_USECOLS)
     pricing = pricing[pricing["brand"].isin(OWN_BRANDS + TRACKED_COMPETITORS)]
 
     GROUP = ["inserted_date", "platform", "brand", "brand_type",
@@ -474,11 +481,13 @@ def _load_mfilterit_cached(_pricing_key, _avail_key,
     return price_df, availability
 
 
-def load_mfilterit_data(pricing_path, availability_path):
+
+def load_mfilterit_data(availability_path):
+    pricing_key = tuple(_path_cache_key(p) for p in PRICING_FILES)
     return _load_mfilterit_cached(
-        _path_cache_key(pricing_path),
+        pricing_key,
         _path_cache_key(availability_path),
-        pricing_path, availability_path,
+        PRICING_FILES, availability_path,
     )
 
 
@@ -1153,7 +1162,11 @@ st.markdown(
 # ---------------------------------------------------------------------------
 DEFAULT_HIST  = "Online Shopping 24-26 (1).xlsx"
 DEFAULT_MTD   = "Online Shopping MTD.xlsx"
-DEFAULT_PRICE = "mfilterit_pricing.xlsx"
+PRICING_FILES = [
+    "mfilterit_pricing_1.xlsx",
+    "mfilterit_pricing_2.xlsx",
+    # Add "mfilterit_pricing_3.xlsx" here when ready, and so on.
+]
 DEFAULT_AVAIL = "mfilterit_availability.xlsx"
 DEFAULT_KEETA = "Sadafco Keeta Manual Tracker.xlsx"
 DEFAULT_NINJA = "Sadafco_Ninja_Manual_Tracker.xlsx"
@@ -1205,7 +1218,7 @@ if df is not None:
 base_price = base_avail = None
 _dd_load_error = None
 try:
-    base_price, base_avail = load_mfilterit_data(DEFAULT_PRICE, DEFAULT_AVAIL)
+    base_price, base_avail = load_mfilterit_data(DEFAULT_AVAIL)
 except Exception as e:
     _dd_load_error = str(e)
 
@@ -1233,11 +1246,12 @@ except Exception:
 # this is what makes downstream `id(price_df)` / `id(avail_df)` cache keys
 # actually hit.)
 price_df = _build_combined_price(
-    _path_cache_key(DEFAULT_PRICE),
+    tuple(_path_cache_key(p) for p in PRICING_FILES),
     _path_cache_key(keeta_src),
     _path_cache_key(ninja_src),
     base_price, keeta_price, ninja_price,
 )
+
 avail_df = _build_combined_avail(
     _path_cache_key(DEFAULT_AVAIL),
     _path_cache_key(keeta_src),
