@@ -908,13 +908,12 @@ def _build_pricing_trend_fig(
     )
     return fig
 
-
-
 @st.cache_resource(show_spinner=False, max_entries=32)
 def _build_pricing_platform_trend_fig(
-    cache_token,
-    plat: str, brand: str, cat: str, typ: str,
-    d_from: date, d_to: date,
+        cache_token,
+        plat: str, brand: str, cat: str, typ: str,
+        d_from: date, d_to: date,
+        cd_from: date, cd_to: date,
 ):
     """Average price per day, one line per platform."""
     indexed = _filter_and_index_pricing(price_df, cache_token, plat, brand, cat, typ)
@@ -922,50 +921,86 @@ def _build_pricing_platform_trend_fig(
 
     if main_local is None or main_local.empty or "Platform" not in main_local.columns:
         return None
+    if main_local is None or main_local.empty or "Platform" not in main_local.columns:
+        return None
 
-    # Daily mean price per platform
-    daily = (main_local.reset_index()
-                       .groupby(["Date", "Platform"], observed=True)["Price"]
-                       .mean()
-                       .reset_index())
-    daily["Date"] = pd.to_datetime(daily["Date"])
-    daily["Platform"] = daily["Platform"].astype(str)
+    comp_local = _slice_by_date(indexed, cd_from, cd_to)
 
-    platforms = sorted(daily["Platform"].unique())
+    DOW_ORDER = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+    def _daily_by_platform(frame, label):
+        if frame is None or frame.empty:
+            return pd.DataFrame()
+        d = frame.reset_index()
+        d["Date"] = pd.to_datetime(d["Date"])
+        d["DOW"] = pd.Categorical(
+            d["Date"].dt.day_name().str[:3],
+            categories=DOW_ORDER,
+            ordered=True,
+        )
+        d["Platform"] = d["Platform"].astype(str)
+        d = (d.groupby(["DOW", "Platform"], observed=True)["Price"]
+             .mean()
+             .reset_index())
+        d["Range"] = label
+        return d
+
+    main_daily = _daily_by_platform(main_local, "main")
+    comp_daily = _daily_by_platform(comp_local, "comp")
+
+    main_plats = main_daily["Platform"].unique().tolist() if not main_daily.empty else []
+    comp_plats = comp_daily["Platform"].unique().tolist() if not comp_daily.empty else []
+    platforms = sorted(set(main_plats + comp_plats))
     if not platforms:
         return None
 
     fig = go.Figure()
     for plat_name in platforms:
-        pdata = daily[daily["Platform"] == plat_name].sort_values("Date")
-        fig.add_trace(go.Scatter(
-            x=pdata["Date"],
-            y=pdata["Price"],
-            mode="lines+markers",
-            name=plat_name,
-            line=dict(color=PLATFORM_COLORS.get(plat_name, "#9CA3AF"), width=2),
-            marker=dict(size=6),
-            hovertemplate=(
-                f"<b>{plat_name}</b><br>"
-                "%{x|%d %b %Y}<br>"
-                "SAR %{y:.2f}<extra></extra>"
-            ),
-        ))
+        color = PLATFORM_COLORS.get(plat_name, "#9CA3AF")
+        # Main — solid line
+        pdata = main_daily[main_daily["Platform"] == plat_name].sort_values("DOW")
+        if not pdata.empty:
+            fig.add_trace(go.Scatter(
+                x=pdata["DOW"], y=pdata["Price"],
+                mode="lines+markers",
+                name=f"{plat_name} ({d_from:%d %b}–{d_to:%d %b})",
+                line=dict(color=color, width=2),
+                marker=dict(size=6),
+                hovertemplate=(
+                    f"<b>{plat_name}</b> (main)<br>"
+                    "%{x|%d %b %Y}<br>SAR %{y:.2f}<extra></extra>"
+                ),
+            ))
+        # Comparison — dashed line, same colour
+        cdata = comp_daily[comp_daily["Platform"] == plat_name].sort_values("DOW")
+        if not cdata.empty:
+            fig.add_trace(go.Scatter(
+                x=cdata["DOW"], y=cdata["Price"],
+                mode="lines+markers",
+                name=f"{plat_name} ({cd_from:%d %b}–{cd_to:%d %b})",
+                line=dict(color=color, width=2, dash="dash"),
+                marker=dict(size=6, symbol="diamond"),
+                hovertemplate=(
+                    f"<b>{plat_name}</b> (comparison)<br>"
+                    "%{x|%d %b %Y}<br>SAR %{y:.2f}<extra></extra>"
+                ),
+            ))
 
     fig.update_layout(
-        height=400,
+        height=420,
         margin=dict(l=10, r=10, t=10, b=10),
         plot_bgcolor="white",
         yaxis=dict(gridcolor="#e5e7eb", title="Average price (SAR)"),
-        xaxis=dict(gridcolor="#e5e7eb", title=""),
+        xaxis=dict(
+            gridcolor="#e5e7eb", title="Day of week",
+            categoryorder="array", categoryarray=DOW_ORDER,
+        ),
         legend=dict(
             orientation="h", yanchor="bottom",
             y=1.02, xanchor="right", x=1,
-            title_text="Platform",
         ),
     )
     return fig
-
 
 # ---------------------------------------------------------------------------
 # Cached AVAILABILITY builders (drill HTML + bar chart)
@@ -1996,15 +2031,19 @@ if active_tab == "💲 Pricing":
                 #             "Price trend by platform</div>",
                 #             unsafe_allow_html=True)
 
-                platform_trend_fig = _build_pricing_platform_trend_fig(
-                    id(price_df),
-                    pr_f_plat, pr_f_brand, pr_f_cat, pr_f_type,
-                    pr_date_from, pr_date_to,
-                )
-                if platform_trend_fig is None:
-                    st.info("No daily price observations to plot by platform.")
-                else:
-                    st.plotly_chart(platform_trend_fig, use_container_width=True)
+                try:
+                    platform_trend_fig = _build_pricing_platform_trend_fig(
+                        id(price_df),
+                        pr_f_plat, pr_f_brand, pr_f_cat, pr_f_type,
+                        pr_date_from, pr_date_to,
+                        pr_comp_from, pr_comp_to,
+                    )
+                    if platform_trend_fig is None:
+                        st.info("No data in the selected date ranges to plot by platform.")
+                    else:
+                        st.plotly_chart(platform_trend_fig, use_container_width=True)
+                except Exception:
+                    st.info("No data in the selected date ranges to plot by platform.")
 # ===========================================================================
 # TAB 3 — AVAILABILITY
 # ===========================================================================
