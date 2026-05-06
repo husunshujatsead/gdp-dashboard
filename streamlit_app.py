@@ -408,8 +408,9 @@ def _load_mfilterit_cached(_pricing_key, _avail_key,
     OWN_BRANDS = ["Saudia", "Crispy"]
     TRACKED_COMPETITORS = ["Almarai", "Nadec"]
     PLATFORM_MAP_MF = {
-        "quickmarket_ksa":      "Hunger Station",
+        "quickmarket_ksa": "Hunger Station",
         "noon_minutes_ksa_app": "Noon",
+        "ninja_grocery_ksa": "Ninja",  # ← add this line
     }
 
     # 1. AVAILABILITY (OSA wide → long)
@@ -419,9 +420,19 @@ def _load_mfilterit_cached(_pricing_key, _avail_key,
     date_cols = [c for c in osa.columns if hasattr(c, "year")]
     osa = osa.loc[osa["brand"].isin(OWN_BRANDS), ID_COLS + date_cols]
 
-    a = (osa.melt(id_vars=ID_COLS, value_vars=date_cols,
-                  var_name="Date", value_name="Availability")
-            .dropna(subset=["Availability"]))
+    if not date_cols:
+        raise ValueError(
+            "Availability sheet has no date columns — check column headers "
+            "(they need to be real datetime values, not strings)."
+        )
+
+    # pd.melt() has a regression on recent pandas/Python 3.14 that crashes with
+    # "'Series' object has no attribute 'columns'". Manual numpy reshape avoids it.
+    n_rows, n_dates = len(osa), len(date_cols)
+    a = osa[ID_COLS].iloc[np.repeat(np.arange(n_rows), n_dates)].reset_index(drop=True)
+    a["Date"] = np.tile(date_cols, n_rows)
+    a["Availability"] = osa[date_cols].to_numpy().ravel()
+    a = a.dropna(subset=["Availability"])
 
     availability = pd.DataFrame({
         "Brand":        a["brand"].astype("string"),
@@ -508,7 +519,7 @@ def _load_keeta_cached(_key, path_or_buffer):
 
     raw = pd.concat(rows, ignore_index=True)
     raw = raw.dropna(subset=["SKU"])
-    snap_date = pd.Timestamp(date.today() - timedelta(days=1))
+    snap_date = pd.Timestamp("2026-04-25")
 
     def _keeta_brand(sku):
         s = str(sku).lower()
@@ -868,13 +879,23 @@ def _build_pricing_trend_fig(
                           "(%{customdata} day(s) in range)<extra></extra>",
         ))
     fig.update_layout(
-        height=380, margin=dict(l=10, r=10, t=10, b=10),
+        height=380, margin=dict(l=10, r=10, t=48, b=10),
         plot_bgcolor="white",
+        title=dict(
+            text=(
+                f"<b>Price trend</b>  "
+                f"<span style='color:{NAVY}'>——</span> Main ({d_from:%d %b} – {d_to:%d %b})   "
+                f"<span style='color:{SAUDIA_BLUE}'>- - -</span> Comparison ({cd_from:%d %b} – {cd_to:%d %b})"
+            ),
+            font=dict(size=13, color="#374151"),
+            x=0,
+            xanchor="left",
+            pad=dict(l=4),
+        ),
         yaxis=dict(gridcolor="#e5e7eb", title="Average price (SAR)"),
         xaxis=dict(title="Day of week", gridcolor="#e5e7eb",
                    categoryorder="array", categoryarray=DOW_ORDER),
-        legend=dict(orientation="h", yanchor="bottom",
-                    y=1.02, xanchor="right", x=1),
+        showlegend=False,
     )
     return fig
 
@@ -1131,7 +1152,7 @@ st.markdown(
 # Sidebar
 # ---------------------------------------------------------------------------
 DEFAULT_HIST  = "Online Shopping 24-26 (1).xlsx"
-DEFAULT_MTD   = "Online Shopping MTD (3).xlsx"
+DEFAULT_MTD   = "Online Shopping MTD.xlsx"
 DEFAULT_PRICE = "mfilterit_pricing.xlsx"
 DEFAULT_AVAIL = "mfilterit_availability.xlsx"
 DEFAULT_KEETA = "Sadafco Keeta Manual Tracker.xlsx"
@@ -1889,13 +1910,6 @@ if active_tab == "💲 Pricing":
         else:
             st.markdown(drill_html, unsafe_allow_html=True)
             # -------- Trendline: main vs comparison range (cached) --------
-            st.markdown("<div class='sec-title' style='margin-top:24px;'>"
-                        "Price trend — main vs comparison</div>",
-                        unsafe_allow_html=True)
-            st.markdown("<div class='sec-sub'>Average price by day of week. "
-                        "Solid line = main range, dashed = comparison.</div>",
-                        unsafe_allow_html=True)
-
             trend_fig = _build_pricing_trend_fig(
                 id(price_df),
                 pr_f_plat, pr_f_brand, pr_f_cat, pr_f_type,
