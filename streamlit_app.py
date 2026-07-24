@@ -971,6 +971,55 @@ if active_tab == "📊 Sales Tracker":
                     f"<div class='pivot-wrap'><table>{phead}<tbody>{''.join(pbody)}</tbody></table></div>",
                     unsafe_allow_html=True,
                 )
+                # ----- Top 3 SKUs by Quantity -----
+                st.markdown("<h2 class='sec-title' style='margin-top:32px;'>Top 3 SKUs by Sales Quantity</h2>",
+                            unsafe_allow_html=True)
+                st.markdown("<div class='sec-sub'>Highest unit-volume SKUs under the current filters.</div>",
+                            unsafe_allow_html=True)
+
+                top_sku_platform = st.selectbox(
+                    "Platform", ["All"] + sorted(fdf["Platform"].dropna().astype(str).unique().tolist()),
+                    index=0, key="top_sku_plat",
+                )
+                top_base = fdf if top_sku_platform == "All" else fdf[fdf["Platform"].astype(str) == top_sku_platform]
+
+                top3 = (top_base.groupby("SKU", observed=True)
+                        .agg(**{"Sales Qty": ("Sales Qty", "sum"),
+                                "Sales Val": ("Sales Val", "sum")})
+                        .sort_values("Sales Qty", ascending=False)
+                        .head(3)
+                        .reset_index())
+
+                if top3.empty or top3["Sales Qty"].sum() == 0:
+                    st.info("No units recorded under the current filters.")
+                else:
+                    t_head = "<thead><tr><th>Rank</th><th>SKU</th><th>Units</th><th>Sales Val (SAR)</th></tr></thead>"
+                    t_body = []
+                    for i, r in top3.iterrows():
+                        t_body.append(
+                            "<tr>"
+                            f"<td class='row-label'>{i + 1}</td>"
+                            f"<td class='row-label'>{r['SKU']}</td>"
+                            f"<td class='num'>{human(r['Sales Qty'])}</td>"
+                            f"<td class='num'>{human(r['Sales Val'])}</td>"
+                            "</tr>"
+                        )
+                    st.markdown(
+                        f"<div class='pivot-wrap'><table>{t_head}<tbody>{''.join(t_body)}</tbody></table></div>",
+                        unsafe_allow_html=True,
+                    )
+
+                    fig = go.Figure(go.Bar(
+                        x=top3["Sales Qty"][::-1], y=top3["SKU"].astype(str)[::-1], orientation="h",
+                        marker=dict(color=SAUDIA_BLUE),
+                        text=[human(v) for v in top3["Sales Qty"][::-1]],
+                        textposition="outside", cliponaxis=False,
+                    ))
+                    fig.update_layout(height=260, margin=dict(l=10, r=60, t=10, b=10),
+                                      plot_bgcolor="white",
+                                      xaxis=dict(gridcolor="#e5e7eb", title="Units sold"),
+                                      yaxis=dict(title=""))
+                    st.plotly_chart(fig, use_container_width=True)
 
         def build_excel():
             out = io.BytesIO()
@@ -983,6 +1032,10 @@ if active_tab == "📊 Sales Tracker":
                     pd.DataFrame(vol_rows).set_index("SKU").to_excel(xl, sheet_name="Focus SKU Volumes")
                 fdf[["Date", "Platform", "Category", "Brand", "SKU",
                      "Sales Val", "Sales Qty"]].to_excel(xl, sheet_name="Filtered Data", index=False)
+
+            if not top3.empty:
+                top3.to_excel(xl, sheet_name="Top 3 SKUs by Qty", index=False)
+
             return out.getvalue()
 
         st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
